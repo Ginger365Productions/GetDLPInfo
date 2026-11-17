@@ -33,6 +33,10 @@
       and for the complete report 00_Assessment_Summary.csv/.html and DLP_Assessment_Report.docx
       (a plain-English Word report explaining each area, the findings and Microsoft Learn links).
 
+.PARAMETER Frameworks
+    Frameworks referenced in the Word report: any of NCSC, NISTCSF, NIST80053, ISO27001 (or NIST, ISO, All, None).
+    Default: all four.
+
 .PARAMETER NoWordReport
     Do not create DLP_Assessment_Report.docx at the end of the complete report.
 
@@ -79,6 +83,7 @@ param(
     [switch]$IncludeExchange,
     [switch]$DisableWAM,
     [switch]$NoWordReport,
+    [string[]]$Frameworks = @('NCSC', 'NISTCSF', 'NIST80053', 'ISO27001'),
     [switch]$NoDisconnect
 )
 
@@ -95,6 +100,7 @@ $Script:Settings = [ordered]@{
     IncludeExchange   = [bool]$IncludeExchange
     DisableWAM        = [bool]$DisableWAM
     WordReport        = -not [bool]$NoWordReport
+    Frameworks        = $Frameworks
 }
 $Script:RequiredModules = @(
     [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; MinVersion = [version]'3.2.0'; Required = $true;  Purpose = 'Security & Compliance and Exchange Online cmdlets' }
@@ -1127,7 +1133,12 @@ function Add-DocTable {
         for ($i = 0; $i -lt $Headers.Count; $i++) {
             $v = if ($i -lt $cells.Count) { [string]$cells[$i] } else { '' }
             if ($v.Length -gt 600) { $v = $v.Substring(0, 600) + ' ...' }
-            [void]$sb.Append("<w:tc><w:tcPr><w:tcW w:w=`"$($tw[$i])`" w:type=`"dxa`"/>$fill</w:tcPr><w:p><w:pPr><w:spacing w:before=`"0`" w:after=`"0`"/></w:pPr>$(New-DocRuns $v -Size $FontSize)</w:p></w:tc>")
+            $cellFill = $fill; $bold = $false
+            if ($v -match '^\[\[([GARN])\]\]') {
+                $rag = @{ G = 'C6EFCE'; A = 'FFEB9C'; R = 'FFC7CE'; N = 'E7E6E6' }[$Matches[1]]
+                $cellFill = "<w:shd w:val=`"clear`" w:color=`"auto`" w:fill=`"$rag`"/>"; $v = $v.Substring(5); $bold = $true
+            }
+            [void]$sb.Append("<w:tc><w:tcPr><w:tcW w:w=`"$($tw[$i])`" w:type=`"dxa`"/>$cellFill</w:tcPr><w:p><w:pPr><w:spacing w:before=`"0`" w:after=`"0`"/></w:pPr>$(New-DocRuns $v -Size $FontSize -Bold:$bold)</w:p></w:tc>")
         }
         [void]$sb.Append('</w:tr>')
         $r++
@@ -1210,11 +1221,12 @@ function Add-SectionGap {
 }
 
 function Add-SectionEnd {
-    param([string[]]$Considerations, [string[]]$LinkKeys)
+    param([string[]]$Considerations, [string[]]$LinkKeys, [string]$Area)
     Add-DocHeading 'Things to consider' 3
     $c = @($Considerations | Where-Object { $_ })
     if ($c.Count -eq 0) { Add-DocPara 'No specific issues were identified from the configuration collected for this area.' }
     else { foreach ($x in $c) { Add-DocBullet $x } }
+    if ($Area) { Add-FrameworkTable -Area $Area }
     Add-DocHeading 'Learn more on Microsoft Learn' 3
     foreach ($k in $LinkKeys) { $l = $Script:LearnLinks[$k]; if ($l) { Add-DocLink -Title $l.Title -Url $l.Url -AsBullet } }
 }
@@ -1282,10 +1294,482 @@ function Save-WordDoc {
     finally { $fs.Dispose() }
 }
 
+# ---------- Framework references (indicative mappings; confirm against the framework documents) ----------
+$Script:FrameworkInfo = [ordered]@{
+    NCSC      = @{ Name = 'NCSC Cyber Assessment Framework (CAF) v4.0 and 10 Steps'; Short = 'NCSC'; Url = 'https://www.ncsc.gov.uk/collection/cyber-assessment-framework'; About = 'UK National Cyber Security Centre framework of outcomes for organisations that support essential services. Principle B3 (Data security) is the main principle for DLP. The NCSC 10 Steps to Cyber Security (Data security, Logging and monitoring) give lighter-weight guidance for other organisations.' }
+    NISTCSF   = @{ Name = 'NIST Cybersecurity Framework (CSF) 2.0'; Short = 'NIST CSF 2.0'; Url = 'https://www.nist.gov/cyberframework'; About = 'US NIST outcome-based framework. The Data Security category (PR.DS) covers data at rest (PR.DS-01), in transit (PR.DS-02) and in use (PR.DS-10).' }
+    NIST80053 = @{ Name = 'NIST SP 800-53 Rev. 5 security controls'; Short = 'NIST 800-53'; Url = 'https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final'; About = 'Catalogue of security controls. AC-4 (Information flow enforcement) and SC-7(10) (Prevent exfiltration) are the controls most directly met by DLP. NIST SP 1800-28 (Data Confidentiality) gives a practical reference architecture.' }
+    ISO27001  = @{ Name = 'ISO/IEC 27001:2022 Annex A'; Short = 'ISO 27001'; Url = 'https://www.iso.org/standard/27001'; About = 'International standard for information security management. Control 8.12 (Data leakage prevention) was added in the 2022 revision and is the core DLP control.' }
+}
+
+# Area -> framework references. Expects = what the framework is looking for, in plain English.
+$Script:FrameworkMap = @{
+    Policies    = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3 Data security; 10 Steps: Data security'; Expects = 'Data is protected from unauthorised access, modification or deletion, using controls proportionate to its importance.' }
+        @{ Fw = 'NISTCSF'; Ref = 'GV.PO-01, PR.DS'; Expects = 'A policy for managing data risk exists and data security outcomes are implemented.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-4, SC-7(10)'; Expects = 'Approved rules control where information can flow, and exfiltration is prevented.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12, 5.1'; Expects = 'Data leakage prevention measures are applied and supported by an information security policy.' }
+    )
+    Coverage    = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.b Data in transit; B3.c Stored data'; Expects = 'Data is protected when sent (email, chat, sharing) and where it is stored (sites, OneDrive).' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.DS-01, PR.DS-02'; Expects = 'Confidentiality of data at rest and in transit is protected.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-4, SC-7(10)'; Expects = 'Information flow controls apply on every route data can leave the organisation.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12, 5.14'; Expects = 'DLP applies to the systems and channels that process sensitive data, including information transfer.' }
+    )
+    Rules       = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.b, B3.c'; Expects = 'Controls actively prevent inappropriate sharing, not only record it.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.DS-01, PR.DS-02'; Expects = 'Data protection is enforced in line with risk.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-4, SC-7(10)'; Expects = 'Unauthorised flows are blocked, with approved exceptions.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12, 5.14'; Expects = 'Leakage is detected and prevented, with defined actions.' }
+    )
+    UX          = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B6 Staff awareness'; Expects = 'Staff understand how to handle data securely and are supported to do so.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.AT-01'; Expects = 'People are made aware of security risks relevant to their work.' }
+        @{ Fw = 'NIST80053'; Ref = 'AT-2'; Expects = 'Users receive security awareness at the point it is needed.' }
+        @{ Fw = 'ISO27001'; Ref = '6.3, 8.12'; Expects = 'Awareness of information security responsibilities; DLP measures explained to users.' }
+    )
+    SIT         = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a Understanding data'; Expects = 'You know what sensitive data you hold and can recognise it.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.AM-07'; Expects = 'Sensitive data types are identified and inventoried.' }
+        @{ Fw = 'NIST80053'; Ref = 'RA-2, AC-16'; Expects = 'Information is categorised and its sensitivity can be identified.' }
+        @{ Fw = 'ISO27001'; Ref = '5.12, 8.12'; Expects = 'Information is classified, and DLP identifies sensitive information.' }
+    )
+    CustomSIT   = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a Understanding data'; Expects = 'Organisation-specific important data is understood and identifiable.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.AM-07'; Expects = 'Designated data types, including organisation-specific ones, are inventoried.' }
+        @{ Fw = 'NIST80053'; Ref = 'RA-2, AC-16'; Expects = 'Categorisation covers the organisation''s own information types.' }
+        @{ Fw = 'ISO27001'; Ref = '5.12, 8.12'; Expects = 'Classification reflects the organisation''s own information.' }
+    )
+    EDM         = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a Understanding data'; Expects = 'The most important datasets are known and precisely identified.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.AM-07, PR.DS-01'; Expects = 'Key datasets are inventoried and protected.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-16, SC-7(10)'; Expects = 'Accurate identification supports effective exfiltration controls.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12'; Expects = 'Detection is accurate enough to act on.' }
+    )
+    Classifiers = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a Understanding data'; Expects = 'Sensitive document types are recognised, not only identifiers.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.AM-07'; Expects = 'Data types are identified, including unstructured content.' }
+        @{ Fw = 'NIST80053'; Ref = 'RA-2, AC-16'; Expects = 'Content is categorised by its nature.' }
+        @{ Fw = 'ISO27001'; Ref = '5.12, 8.12'; Expects = 'Classification covers documents as well as data items.' }
+    )
+    Confidence  = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a, B3.b'; Expects = 'Controls are tuned so they protect data without excessive disruption.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.DS-01, PR.DS-02'; Expects = 'Protection is effective in practice.' }
+        @{ Fw = 'NIST80053'; Ref = 'SC-7(10)'; Expects = 'Exfiltration controls are tested and effective.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12'; Expects = 'DLP is operating effectively.' }
+    )
+    Labels      = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a, B3.c Stored data'; Expects = 'Sensitivity of data is understood and stored data is protected accordingly.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.AM-07, PR.DS-01'; Expects = 'Data is classified and protected at rest.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-16, MP-3'; Expects = 'Security attributes (labels) are applied and content is marked.' }
+        @{ Fw = 'ISO27001'; Ref = '5.12, 5.13, 8.12'; Expects = 'Information is classified and labelled, and labels drive handling.' }
+    )
+    Endpoint    = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.d Mobile data; 10 Steps: Data security'; Expects = 'Data on devices and removable media is protected.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.DS-10, PR.DS-01'; Expects = 'Data in use on devices is protected.' }
+        @{ Fw = 'NIST80053'; Ref = 'MP-7, SC-7(10)'; Expects = 'Use of removable media is controlled and exfiltration from endpoints is prevented.' }
+        @{ Fw = 'ISO27001'; Ref = '7.10, 8.1, 8.12'; Expects = 'Storage media and user endpoint devices are controlled; DLP applies to endpoints.' }
+    )
+    Copilot     = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B3.a, B3.c'; Expects = 'Sensitive data is protected wherever it is processed, including by AI services.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.DS-10'; Expects = 'Data in use is protected.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-4'; Expects = 'Information flows into AI services follow approved rules.' }
+        @{ Fw = 'ISO27001'; Ref = '8.12, 5.23'; Expects = 'DLP extends to cloud services, including AI.' }
+    )
+    Simulation  = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF B1 Policies, processes and procedures'; Expects = 'Protection is delivered through defined, managed processes.' }
+        @{ Fw = 'NISTCSF'; Ref = 'ID.IM-01'; Expects = 'Evaluations are used to identify improvements.' }
+        @{ Fw = 'NIST80053'; Ref = 'CM-4'; Expects = 'The impact of changes is analysed before they are made.' }
+        @{ Fw = 'ISO27001'; Ref = '8.32'; Expects = 'Changes are controlled and tested.' }
+    )
+    Alerts      = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF C1 Security monitoring; 10 Steps: Logging and monitoring'; Expects = 'Security events are monitored and acted on.' }
+        @{ Fw = 'NISTCSF'; Ref = 'DE.CM-03, DE.AE'; Expects = 'Activity is monitored and adverse events are analysed.' }
+        @{ Fw = 'NIST80053'; Ref = 'SI-4, AU-13'; Expects = 'Systems are monitored, including for information disclosure.' }
+        @{ Fw = 'ISO27001'; Ref = '8.16, 8.12'; Expects = 'Activities are monitored and leakage events are acted on.' }
+    )
+    Activity    = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF C1 Security monitoring'; Expects = 'Monitoring data is collected and reviewed.' }
+        @{ Fw = 'NISTCSF'; Ref = 'DE.CM-03'; Expects = 'Personnel activity is monitored to find adverse events.' }
+        @{ Fw = 'NIST80053'; Ref = 'AU-13, SI-4'; Expects = 'Information disclosure is monitored.' }
+        @{ Fw = 'ISO27001'; Ref = '8.15, 8.16'; Expects = 'Activity is logged and monitored.' }
+    )
+    Exchange    = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF C1 Security monitoring; B3.b'; Expects = 'Audit data is available and email controls are consistent.' }
+        @{ Fw = 'NISTCSF'; Ref = 'PR.PS-04, DE.CM-03'; Expects = 'Log records are generated and available for monitoring.' }
+        @{ Fw = 'NIST80053'; Ref = 'AU-2, AU-12, AC-4'; Expects = 'Auditable events are logged; email flow controls are managed.' }
+        @{ Fw = 'ISO27001'; Ref = '8.15, 5.14'; Expects = 'Logging is enabled and information transfer is controlled.' }
+    )
+    Ownership   = @(
+        @{ Fw = 'NCSC'; Ref = 'CAF A1 Governance; B2 Identity and access control'; Expects = 'Clear accountability, and privileged access is limited and managed.' }
+        @{ Fw = 'NISTCSF'; Ref = 'GV.RR-02, PR.AA-05'; Expects = 'Roles and responsibilities are defined; access follows least privilege.' }
+        @{ Fw = 'NIST80053'; Ref = 'AC-5, AC-6'; Expects = 'Duties are separated and privileges are minimised.' }
+        @{ Fw = 'ISO27001'; Ref = '5.2, 5.3, 8.2'; Expects = 'Roles are assigned, duties segregated and privileged access controlled.' }
+    )
+}
+$Script:AreaNames = [ordered]@{
+    Policies = 'DLP policies'; Coverage = 'Where DLP is applied'; Rules = 'Rules and actions'; UX = 'Policy tips and overrides'
+    SIT = 'Sensitive information types'; CustomSIT = 'Custom SITs and dictionaries'; EDM = 'Exact Data Match'; Classifiers = 'Trainable classifiers'
+    Confidence = 'Confidence levels'; Labels = 'Sensitivity labels'; Endpoint = 'Endpoint DLP (devices)'; Copilot = 'Microsoft 365 Copilot'
+    Simulation = 'Deployment and simulation'; Alerts = 'Alerts'; Activity = 'Activity Explorer'; Exchange = 'Exchange mail flow and audit'; Ownership = 'Operational ownership'
+}
+$Script:StatusText = @{ G = 'Supported'; A = 'Partial'; R = 'Gap'; N = 'Not assessed' }
+
+function Get-SelectedFrameworks {
+    $sel = @($Script:Settings.Frameworks | ForEach-Object { ($_ -split ',') } | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+    if ($sel -contains 'NIST') { $sel += 'NISTCSF', 'NIST80053' }
+    if ($sel -contains 'ISO') { $sel += 'ISO27001' }
+    if ($sel -contains 'ALL' -or $sel.Count -eq 0) { $sel = @($Script:FrameworkInfo.Keys) }
+    @($Script:FrameworkInfo.Keys | Where-Object { $sel -contains $_.ToUpper() })
+}
+
+function Add-FrameworkTable {
+    param([string]$Area)
+    $fws = @(Get-SelectedFrameworks)
+    if ($fws.Count -eq 0 -or -not $Script:FrameworkMap.ContainsKey($Area)) { return }
+    $st = if ($Script:AreaStatus.ContainsKey($Area)) { $Script:AreaStatus[$Area] } else { 'N' }
+    Add-DocHeading 'Framework alignment' 3
+    $rows = @(foreach ($m in $Script:FrameworkMap[$Area]) {
+            if ($fws -notcontains $m.Fw) { continue }
+            , @($Script:FrameworkInfo[$m.Fw].Short, $m.Ref, $m.Expects, "[[$st]]$($Script:StatusText[$st])")
+        })
+    Add-DocTable -Headers @('Framework', 'Reference', 'What the framework expects', 'This tenant') -Widths @(1.3, 1.9, 4, 1.1) -FontSize 16 -Rows $rows
+}
+
+function Add-DocCode {
+    <# Monospace, shaded block for PowerShell examples. #>
+    param([string]$Code)
+    $lines = @($Code.Trim("`r", "`n") -split "`r?`n")
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $after = if ($i -eq $lines.Count - 1) { 160 } else { 0 }
+        $t = if ($lines[$i] -eq '') { ' ' } else { $lines[$i] }
+        Add-DocXml "<w:p><w:pPr><w:pBdr><w:left w:val=`"single`" w:sz=`"18`" w:space=`"6`" w:color=`"0F4C81`"/></w:pBdr><w:shd w:val=`"clear`" w:color=`"auto`" w:fill=`"F2F4F7`"/><w:spacing w:before=`"0`" w:after=`"$after`" w:line=`"240`" w:lineRule=`"auto`"/><w:ind w:left=`"180`"/></w:pPr><w:r><w:rPr><w:rFonts w:ascii=`"Consolas`" w:hAnsi=`"Consolas`" w:cs=`"Consolas`"/><w:color w:val=`"1E1E1E`"/><w:sz w:val=`"16`"/><w:szCs w:val=`"16`"/></w:rPr><w:t xml:space=`"preserve`">$(ConvertTo-XmlText $t)</w:t></w:r></w:p>"
+    }
+}
+
+function Add-DocSteps {
+    param([string[]]$Steps)
+    $n = 1
+    foreach ($s in $Steps) {
+        Add-DocXml "<w:p><w:pPr><w:spacing w:after=`"60`"/><w:ind w:left=`"540`" w:hanging=`"360`"/></w:pPr>$(New-DocRuns "**$n.**")<w:r><w:tab/></w:r>$(New-DocRuns $s)</w:p>"
+        $n++
+    }
+}
+
+function Add-Guidance {
+    <# One block of implementation guidance. #>
+    param([string]$Title, [string]$When, [string]$Area, [string[]]$Portal, [string]$PowerShell, [string[]]$Validate, [string[]]$LinkKeys)
+    Add-DocHeading $Title 2
+    Add-DocCallout 'Why this applies:' $When 'FFF4E5' 'E08A00'
+    if ($Area -and $Script:FrameworkMap.ContainsKey($Area)) {
+        $fws = @(Get-SelectedFrameworks)
+        $refs = @($Script:FrameworkMap[$Area] | Where-Object { $fws -contains $_.Fw } | ForEach-Object { "$($Script:FrameworkInfo[$_.Fw].Short) $($_.Ref)" })
+        if ($refs.Count) { Add-DocPara ("**Supports:** " + ($refs -join '  |  ')) -Size 18 -Color '1F3B57' }
+    }
+    Add-DocHeading 'Steps in the Microsoft Purview portal' 3
+    Add-DocSteps $Portal
+    if ($PowerShell) {
+        Add-DocHeading 'PowerShell example' 3
+        Add-DocPara 'Run in Security & Compliance PowerShell (Connect-IPPSSession). Replace the example names and values, and create new policies in simulation mode first.' -Size 18 -Color '555555' -Italic
+        Add-DocCode $PowerShell
+    }
+    if ($Validate) {
+        Add-DocHeading 'Check it worked' 3
+        foreach ($v in $Validate) { Add-DocBullet $v }
+    }
+    if ($LinkKeys) {
+        Add-DocHeading 'Microsoft Learn' 3
+        foreach ($k in $LinkKeys) { $l = $Script:LearnLinks[$k]; if ($l) { Add-DocLink -Title $l.Title -Url $l.Url -AsBullet } }
+    }
+}
+
+function Add-FrameworkMatrix {
+    $fws = @(Get-SelectedFrameworks)
+    if ($fws.Count -eq 0) { return }
+    $headers = @('Area') + @($fws | ForEach-Object { $Script:FrameworkInfo[$_].Short }) + @('This tenant')
+    $widths = @(2.2) + @($fws | ForEach-Object { 1.9 }) + @(1.2)
+    $rows = @(foreach ($a in $Script:AreaNames.Keys) {
+            $st = if ($Script:AreaStatus.ContainsKey($a)) { $Script:AreaStatus[$a] } else { 'N' }
+            $cells = @($Script:AreaNames[$a])
+            foreach ($f in $fws) { $cells += ((@($Script:FrameworkMap[$a] | Where-Object { $_.Fw -eq $f } | ForEach-Object { $_.Ref })) -join '; ') }
+            $cells += "[[$st]]$($Script:StatusText[$st])"
+            , $cells
+        })
+    Add-DocTable -Headers $headers -Widths $widths -FontSize 15 -Rows $rows
+}
+
+function Add-ImplementationGuidance {
+    param($Ctx)
+    Add-DocHeading '21. Applying the configuration' 1
+    Add-DocPara 'This section gives practical guidance for the gaps found in this assessment. Only guidance relevant to this tenant is included. Each item shows why it applies, which framework references it supports, the steps in the Microsoft Purview portal, an example PowerShell command, and how to check the change worked.'
+    Add-DocCallout 'Before you start:' 'Agree each change with the policy owner, test new or changed policies in simulation mode first, pilot with a small group, and record changes through your normal change process. Menu names in the Microsoft Purview portal change from time to time; if a path differs, follow the linked Microsoft Learn article.' 'EEF3F9' '0F4C81'
+
+    Add-DocHeading 'Recommended order of work' 2
+    Add-DocSteps @(
+        'Agree the sensitive information types and scenarios that matter most (customer, financial, employee and organisation-specific data).'
+        'Make sure sensitivity labels are defined and published, so people and policies can use them.'
+        'Create or extend DLP policies to cover email, SharePoint, OneDrive and Teams, starting in simulation mode.'
+        'Extend protection to devices (Endpoint DLP) and Microsoft 365 Copilot.'
+        'Review simulation results, tune confidence and instance counts, and agree policy tip wording.'
+        'Move policies to enforcement in waves, with a pilot group first.'
+        'Set up alerting, review processes and ownership, and re-run this assessment to confirm the changes.'
+    )
+    $n = 0
+    if ($Ctx.Gaps.Count -gt 0 -or $Ctx.Policies -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Create or extend DLP policies to all core locations" -Area 'Coverage' `
+            -When $(if ($Ctx.Policies -eq 0) { 'No DLP policies exist in the tenant.' } else { "No enforced policy covers: $($Ctx.Gaps -join ', ')." }) `
+            -Portal @(
+            'Go to the Microsoft Purview portal (purview.microsoft.com) > Solutions > Data loss prevention > Policies.'
+            'To extend an existing policy: select it, choose Edit policy, and on the Locations page turn on the missing locations (Exchange email, SharePoint sites, OneDrive accounts, Teams chat and channel messages).'
+            'To create a new policy: select Create policy, choose a template that matches the data (for example a UK or financial template) or Custom, and select the locations.'
+            'Define rules: conditions (sensitive information types or labels, and whether content is shared outside the organisation) and actions (policy tip, block, block with override).'
+            'On the Policy mode page select Run the policy in simulation mode, with policy tips if you want users to see them during the pilot.'
+            'Review and submit.'
+        ) -PowerShell @'
+# Extend an existing policy to Teams (repeat for other missing locations)
+Set-DlpCompliancePolicy -Identity "<Existing policy name>" -AddTeamsLocation All
+
+# Or create a new baseline policy in simulation mode across the core locations
+New-DlpCompliancePolicy -Name "Baseline - Sensitive data" `
+    -ExchangeLocation All -SharePointLocation All -OneDriveLocation All -TeamsLocation All `
+    -Mode TestWithNotifications
+
+New-DlpComplianceRule -Name "Baseline - Credit cards shared externally" -Policy "Baseline - Sensitive data" `
+    -ContentContainsSensitiveInformation @{Name = "Credit Card Number"; minCount = "5"} `
+    -AccessScope NotInOrganization -BlockAccess $true `
+    -NotifyUser Owner -NotifyAllowOverride WithJustification `
+    -GenerateIncidentReport SiteAdmin -ReportSeverityLevel High
+'@ -Validate @(
+            'The policy shows the expected locations and mode under Data loss prevention > Policies.'
+            'Get-DlpCompliancePolicy -Identity "<name>" | Format-List Name, Mode, Workload, DistributionStatus shows DistributionStatus Success.'
+            'Simulation results appear on the policy''s simulation dashboard within a few hours.'
+        ) -LinkKeys @('DlpDeploy', 'DlpReference')
+    }
+    if ($Ctx.Test -gt 0) {
+        $n++
+        Add-Guidance -Title "21.$n Move policies from simulation to enforcement" -Area 'Simulation' `
+            -When "$($Ctx.Test) policies are in simulation or test mode." `
+            -Portal @(
+            'Open each policy in Data loss prevention > Policies and review its simulation results: matches, top sensitive information types, locations and users.'
+            'Investigate a sample of matches to estimate false positives; adjust conditions, confidence or instance counts if needed.'
+            'Agree the go-live date and pilot group with the policy owner and communicate it to users.'
+            'Edit the policy, and on the Policy mode page select Turn the policy on immediately.'
+            'Monitor alerts and user feedback closely for the first two weeks.'
+        ) -PowerShell @'
+# List policies in simulation
+Get-DlpCompliancePolicy | Where-Object Mode -like 'Test*' | Select-Object Name, Mode, Workload
+
+# Turn on enforcement for one policy
+Set-DlpCompliancePolicy -Identity "<Policy name>" -Mode Enable
+'@ -Validate @('Get-DlpCompliancePolicy shows Mode Enable for the policy.', 'Rule matches now apply their actions (check Activity Explorer for DLPRuleMatch events).') -LinkKeys @('DlpSimulation', 'DlpSimStart')
+    }
+    if ($Ctx.AuditOnly -gt 0 -or ($Ctx.Rules -gt 0 -and $Ctx.Tips -eq 0)) {
+        $n++
+        Add-Guidance -Title "21.$n Add policy tips and proportionate actions to rules" -Area 'UX' `
+            -When $(if ($Ctx.AuditOnly -gt 0) { "$($Ctx.AuditOnly) rules only audit, so users are not told and nothing is prevented." } else { 'No rules notify users.' }) `
+            -Portal @(
+            'Open the policy in Data loss prevention > Policies, choose Edit policy and go to Advanced DLP rules.'
+            'Edit the rule. Under User notifications, turn on notifications and policy tips, and add short custom text: what is wrong, what to do, who to contact.'
+            'Under Actions, choose the response that fits the risk: notify only for low volumes, block with override (justification required) for medium risk, block for high-risk external sharing.'
+            'Under User overrides, allow overrides with a business justification where appropriate.'
+            'Save and keep the policy in simulation until the wording and actions are agreed.'
+        ) -PowerShell @'
+Set-DlpComplianceRule -Identity "<Rule name>" `
+    -NotifyUser Owner `
+    -NotifyPolicyTipCustomText "This item contains sensitive information. Remove it or share only with approved recipients. Questions: servicedesk@contoso.com" `
+    -BlockAccess $true -NotifyAllowOverride WithJustification
+'@ -Validate @('Send a test item containing sample data to an external test address and confirm the policy tip appears.', 'Override justifications appear in Activity Explorer.') -LinkKeys @('PolicyTips', 'DlpReference')
+    }
+    if ($Ctx.Labels -eq 0 -or $Ctx.LabelPolicies -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Define and publish sensitivity labels" -Area 'Labels' `
+            -When $(if ($Ctx.Labels -eq 0) { 'No sensitivity labels exist.' } else { 'Labels exist but no label policy publishes them to users.' }) `
+            -Portal @(
+            'Agree a simple taxonomy with the business, typically four or five labels such as Public, General, Confidential and Highly Confidential, with sublabels only where needed.'
+            'Go to Microsoft Purview portal > Solutions > Information Protection > Sensitivity labels and create each label, including any encryption and content marking.'
+            'Go to Publishing policies (label policies) and publish the labels to a pilot group, with a default label and justification for downgrades if required.'
+            'Expand to all users once the pilot is complete.'
+        ) -PowerShell @'
+# Publish existing labels to a pilot group
+New-LabelPolicy -Name "Pilot label policy" `
+    -Labels "Public","General","Confidential","Highly Confidential" `
+    -ExchangeLocation "pilot-group@contoso.com"
+'@ -Validate @('Pilot users see the labels in Office apps within 24 hours.', 'Get-LabelPolicy lists the policy with the expected labels.') -LinkKeys @('Labels', 'AutoLabel')
+    }
+    if ($Ctx.Labels -gt 0 -and $Ctx.LabelRefs -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Use sensitivity labels as DLP conditions" -Area 'Labels' `
+            -When 'Sensitivity labels exist but no DLP rule uses them.' `
+            -Portal @(
+            'Open (or create) a DLP policy that covers Exchange, SharePoint, OneDrive and Teams.'
+            'Create a rule with the condition Content contains > Sensitivity labels, and select the highest labels (for example Highly Confidential).'
+            'Add the condition Content is shared from Microsoft 365 > with people outside my organization.'
+            'Set the action to restrict access or block, with a policy tip explaining why.'
+            'Run in simulation, review results, then enforce.'
+        ) -PowerShell @'
+# Find the label GUID
+Get-Label | Format-Table DisplayName, Guid
+
+$labelCondition = @{
+    operator = "And"
+    groups   = @(@{
+        operator = "Or"
+        name     = "Default"
+        labels   = @(@{ name = "<Label GUID>"; type = "Sensitivity" })
+    })
+}
+New-DlpComplianceRule -Name "Block external sharing - Highly Confidential" -Policy "<Policy name>" `
+    -ContentContainsSensitiveInformation $labelCondition `
+    -AccessScope NotInOrganization -BlockAccess $true -NotifyUser Owner
+'@ -Validate @('A Highly Confidential test document cannot be shared with an external test account.', '15_DLP_Rule_Classifiers_and_Confidence shows the label as a condition when this assessment is re-run.') -LinkKeys @('LabelCondition')
+    }
+    if ($Ctx.EndpointCov -eq 0 -or $Ctx.Usb -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Onboard devices and restrict USB, printing and uploads" -Area 'Endpoint' `
+            -When $(if ($Ctx.EndpointCov -eq 0) { 'No enforced DLP policy covers devices.' } else { 'Device policies exist but none restrict copying to USB or removable storage.' }) `
+            -Portal @(
+            'Confirm prerequisites: supported Windows 10/11 or macOS devices and the required licences.'
+            'Onboard devices: Microsoft Purview portal > Settings > Device onboarding (devices already onboarded to Microsoft Defender for Endpoint can be turned on there).'
+            'Configure tenant-wide settings: Settings > Data loss prevention > Endpoint DLP settings: service domains (allowed or blocked upload sites), unallowed browsers, printer groups, removable storage device groups and file path exclusions.'
+            'Create or edit a DLP policy with the Devices location. In the rule, add the action Audit or restrict activities on devices and set Copy to removable USB device, Print, and Upload to a restricted cloud service domain to Audit, Warn (block with override) or Block.'
+            'Run in simulation with a pilot group, then enforce.'
+        ) -PowerShell @'
+New-DlpCompliancePolicy -Name "Devices - Sensitive data" `
+    -EndpointDlpLocation All -Mode TestWithNotifications
+
+New-DlpComplianceRule -Name "Devices - USB and print" -Policy "Devices - Sensitive data" `
+    -ContentContainsSensitiveInformation @{Name = "Credit Card Number"} `
+    -EndpointDlpRestrictions @(
+        @{Setting = "RemovableMedia"; Value = "Block"},
+        @{Setting = "Print";          Value = "Warn"}
+    )
+# Values can be Audit, Warn or Block. Configure cloud upload restrictions and device groups
+# in Endpoint DLP settings (see Microsoft Learn).
+'@ -Validate @('Onboarded devices appear in the device list with a healthy policy sync status.', 'Copying a test file containing sample data to USB on a pilot device is blocked or warned.', 'FileCopiedToRemovableMedia events appear in Activity Explorer.') -LinkKeys @('EndpointLearn', 'EndpointSettings', 'EndpointUsing')
+    }
+    if ($Ctx.CopilotCov -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Protect Microsoft 365 Copilot interactions" -Area 'Copilot' `
+            -When 'No DLP policy covers Microsoft 365 Copilot and Copilot Chat.' `
+            -Portal @(
+            'Go to Data loss prevention > Policies > Create policy, and choose the Custom template (the Copilot location is only available there).'
+            'On the Locations page, turn on only Microsoft 365 Copilot and Copilot Chat (selecting it disables other locations for that policy).'
+            'Create a rule with the condition Content contains > Sensitivity labels and select the labels Copilot must not use (for example Highly Confidential).'
+            'Optionally add a rule that checks prompts for sensitive information types.'
+            'Run in simulation, review, then enforce.'
+        ) -PowerShell @'
+# Adapted from the Microsoft Learn New-DlpCompliancePolicy example for Microsoft 365 Copilot
+$loc = '[{"Workload":"Applications","Location":"470f2276-e011-4e9d-a6ec-20768be3a4b0","Inclusions":[{"Type":"Tenant","Identity":"All"}]}]'
+New-DlpCompliancePolicy -Name "Copilot - Exclude Highly Confidential" -Locations $loc -EnforcementPlanes @("CopilotExperiences")
+
+$advRule = @{
+    Version   = "1.0"
+    Condition = @{
+        Operator      = "And"
+        SubConditions = @(@{
+            ConditionName = "ContentContainsSensitiveInformation"
+            Value = @(@{ groups = @(@{ Operator = "Or"; name = "Default"
+                labels = @(@{ name = "<Label GUID>"; type = "Sensitivity" }) }) })
+        })
+    }
+} | ConvertTo-Json -Depth 100
+New-DlpComplianceRule -Name "Copilot - Exclude labelled content" -Policy "Copilot - Exclude Highly Confidential" `
+    -AdvancedRule $advRule -RestrictAccess @(@{setting = "ExcludeContentProcessing"; value = "Block"})
+'@ -Validate @('Copilot does not summarise or reference a Highly Confidential test document for a pilot user.', 'The policy shows the Microsoft 365 Copilot and Copilot Chat location.') -LinkKeys @('Copilot')
+    }
+    if ($Ctx.AlertRules -eq 0 -or $Ctx.SiteOnly -gt 0) {
+        $n++
+        Add-Guidance -Title "21.$n Configure alerts and a review process" -Area 'Alerts' `
+            -When $(if ($Ctx.AlertRules -eq 0) { 'No DLP rules raise alerts.' } else { "$($Ctx.SiteOnly) rules send alerts only to SiteAdmin." }) `
+            -Portal @(
+            'Agree who triages DLP alerts (a named team or shared mailbox), target response times and escalation routes.'
+            'Edit each high-severity rule: under Incident reports, set the severity, turn on alerts to admins, and add the team mailbox as a recipient. Consider aggregated alerts (volume thresholds) for noisy rules.'
+            'Review alerts in Data loss prevention > Alerts, or in Microsoft Defender if you manage incidents there.'
+            'Document the investigation steps and who can approve exceptions.'
+        ) -PowerShell @'
+Set-DlpComplianceRule -Identity "<Rule name>" `
+    -ReportSeverityLevel High `
+    -GenerateAlert "dlp-alerts@contoso.com" `
+    -GenerateIncidentReport "dlp-alerts@contoso.com"
+'@ -Validate @('A test match produces an alert in the DLP alerts dashboard and an email to the team mailbox.') -LinkKeys @('Alerts')
+    }
+    if ($Ctx.LowConf -gt 0) {
+        $n++
+        Add-Guidance -Title "21.$n Tune confidence levels and instance counts" -Area 'Confidence' `
+            -When "$($Ctx.LowConf) detections use low confidence, which commonly causes false positives." `
+            -Portal @(
+            'Use simulation results and Activity Explorer to find the rules and sensitive information types with the most false positives.'
+            'Edit the rule and, for each sensitive information type, raise the confidence level (Medium or High) and/or the minimum instance count.'
+            'Use different rules for low and high volumes: notify for low counts, block for high counts.'
+            'Re-run simulation and compare match volumes.'
+        ) -PowerShell @'
+Set-DlpComplianceRule -Identity "<Rule name>" `
+    -ContentContainsSensitiveInformation @{Name = "<Sensitive information type>"; minCount = "5"; minConfidence = "85"}
+'@ -Validate @('Match volumes drop in simulation without losing genuine incidents.') -LinkKeys @('SitOverview', 'SitDefinitions')
+    }
+    if ($Ctx.Custom -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Create custom sensitive information types for organisation-specific data" -Area 'CustomSIT' `
+            -When 'No custom sensitive information types exist, so internal identifiers (customer, account or staff numbers) cannot be detected.' `
+            -Portal @(
+            'List the organisation-specific identifiers that need protecting, with examples and their exact format.'
+            'Go to Microsoft Purview portal > Data classification > Classifiers > Sensitive info types > Create sensitive info type.'
+            'Define the primary element (a regular expression or keyword list), supporting keywords near the match, and confidence levels.'
+            'Use Test to check the pattern against sample files, then add the new type to a DLP rule in simulation mode.'
+        ) -PowerShell '' -Validate @('The custom type matches test documents and appears in 21_Sensitive_Information_Types_Custom when this assessment is re-run.') -LinkKeys @('SitCustom', 'KeywordDict')
+    }
+    if ($Ctx.Edm -eq 0) {
+        $n++
+        Add-Guidance -Title "21.$n Consider Exact Data Match for key structured datasets" -Area 'EDM' `
+            -When 'Exact Data Match is not in use.' `
+            -Portal @(
+            'Identify one well-defined dataset (for example the customer or employee list), its owner and how often it changes.'
+            'Go to Data classification > Classifiers > EDM classifiers and create an EDM classifier: define the schema (columns and which are searchable) and the primary elements.'
+            'Hash and upload the data using the EDM upload agent from a secure workstation, and schedule refreshes.'
+            'Use the EDM sensitive information type in a DLP rule in simulation mode.'
+        ) -PowerShell '' -Validate @('Test documents containing real records match; documents with look-alike numbers do not.') -LinkKeys @('EdmLearn', 'EdmStart')
+    }
+    if ($Ctx.AuditOff) {
+        $n++
+        Add-Guidance -Title "21.$n Turn on the unified audit log" -Area 'Exchange' `
+            -When 'The unified audit log is disabled. DLP reporting and Activity Explorer depend on it.' `
+            -Portal @('Go to Microsoft Purview portal > Solutions > Audit.', 'If prompted, select Start recording user and admin activity.', 'Allow up to 60 minutes for recording to begin.') `
+            -PowerShell @'
+# Exchange Online PowerShell (Connect-ExchangeOnline)
+Set-AdminAuditLogConfig -UnifiedAuditLogIngestionEnabled $true
+'@ -Validate @('Get-AdminAuditLogConfig shows UnifiedAuditLogIngestionEnabled True.') -LinkKeys @('ActivityExplorer')
+    }
+    if ($n -eq 0) { Add-DocPara 'No specific gaps were identified that need configuration guidance. Review the recommended order of work above and the Things to consider in each section.' }
+}
+
+function Add-FrameworkAppendix {
+    $fws = @(Get-SelectedFrameworks)
+    if ($fws.Count -eq 0) { return }
+    Add-DocHeading 'Appendix D: Framework references' 1
+    Add-DocPara 'This report maps each area of DLP configuration to recognised security frameworks, so findings can be read alongside the organisation''s compliance obligations.'
+    Add-DocCallout 'How to read the mapping:' 'The references show which framework outcomes or controls each area of DLP configuration contributes to. They are indicative mappings, not a compliance assessment: framework outcomes also depend on policies, processes and people that this tool cannot see. Confirm references against the framework documents before using them in formal assurance work.' 'FFF4E5' 'E08A00'
+    foreach ($f in $fws) {
+        $i = $Script:FrameworkInfo[$f]
+        Add-DocHeading $i.Name 2
+        Add-DocPara $i.About
+        Add-DocLink -Title $i.Url -Url $i.Url
+    }
+    if ($fws -contains 'NIST80053') { Add-DocLink -Title 'NIST SP 1800-28: Data Confidentiality - Identifying and Protecting Assets Against Data Breaches' -Url 'https://csrc.nist.gov/pubs/sp/1800/28/final' }
+    Add-DocHeading 'Status values' 2
+    Add-DocTable -Headers @('Status', 'Meaning') -Widths @(1.3, 6) -Rows @(
+        , @('[[G]]Supported', 'The configuration provides evidence towards the referenced outcomes.')
+        , @('[[A]]Partial', 'Some configuration exists, but there are gaps or it is not enforced.')
+        , @('[[R]]Gap', 'No configuration was found that supports the referenced outcomes.')
+        , @('[[N]]Not assessed', 'The data was not collected in this run, or the area cannot be judged from configuration alone.')
+    )
+}
+
 function New-DlpWordReport {
     <# Builds DLP_Assessment_Report.docx from the data collected by the complete report. #>
     Write-Log 'Building Word assessment report...'
     New-WordDoc
+    $Script:AreaStatus = @{}
     $ti = @($Script:Cache['TenantInfo'])
     $org = if ($ti.Count -and $ti[0].Organization) { $ti[0].Organization } else { 'Microsoft 365 tenant' }
     $tid = if ($ti.Count) { $ti[0].TenantId } else { '' }
@@ -1335,7 +1819,9 @@ function New-DlpWordReport {
     Add-DocBullet '**Why it matters** How the feature helps protect sensitive information.'
     Add-DocBullet '**What we found** The configuration in this tenant, with counts and tables.'
     Add-DocBullet '**Things to consider** Observations generated from the data, to discuss and validate. These are prompts for discussion, not mandatory changes.'
+    Add-DocBullet '**Framework alignment** The NCSC, NIST and ISO 27001 references the area supports, what each expects, and the status in this tenant.'
     Add-DocBullet '**Learn more** Links to the relevant Microsoft Learn documentation.'
+    Add-DocPara 'Section 21 gives step-by-step guidance for applying the configuration needed to close the gaps found.'
     Add-DocPara 'Large tables are shortened in this report. The full data for every area is in the CSV, JSON and Excel files produced alongside this document (see Appendix C).'
 
     # ---------- 2 Executive summary ----------
@@ -1377,7 +1863,8 @@ function New-DlpWordReport {
     if ($pOff -gt 0) { $cons += Add-Obs 'DLP policies' 'Low' "$(Get-Plural $pOff 'policy is' 'policies are') disabled. Confirm whether they are still needed; removing obsolete policies keeps the configuration easier to understand." }
     $stale = @($polSum | Where-Object { try { $_.WhenChangedUTC -and ([datetime]$_.WhenChangedUTC) -lt (Get-Date).AddMonths(-18) } catch { $false } })
     if ($stale.Count -gt 0) { $cons += Add-Obs 'DLP policies' 'Low' "$(Get-Plural $stale.Count 'policy has' 'policies have') not been changed for over 18 months. Check they still reflect current business requirements and data types." }
-    Add-SectionEnd $cons @('DlpOverview', 'DlpDeploy', 'DlpReference')
+    $Script:AreaStatus['Policies'] = $(if ($pEnf -gt 0) { 'G' } elseif ($policies.Count -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('DlpOverview', 'DlpDeploy', 'DlpReference') -Area 'Policies'
 
     # ---------- 4 Coverage ----------
     Add-DocHeading '4. Where DLP is applied' 1
@@ -1406,7 +1893,8 @@ function New-DlpWordReport {
     if ($gaps.Count -gt 0 -and $policies.Count -gt 0) { $cons += Add-Obs 'Coverage' 'High' "No enforced policy covers: $($gaps -join ', '). Confirm whether these locations are in scope and, if so, extend existing policies or create new ones." }
     if ($covCount['Teams'] -eq 0 -and $covCount['Exchange'] -gt 0) { $cons += 'Email is protected but Teams is not. Users can often share the same information in a chat message, so consider applying equivalent rules to Teams.' }
     if ($covCount['Endpoint'] -eq 0) { $cons += 'Without Endpoint DLP, protection stops once a file is downloaded to a device. See section 13.' }
-    Add-SectionEnd $cons @('DlpOverview', 'DlpReference')
+    $Script:AreaStatus['Coverage'] = $(if ($gaps.Count -eq 0 -and $policies.Count -gt 0) { 'G' } elseif ($gaps.Count -lt 5) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('DlpOverview', 'DlpReference') -Area 'Coverage'
 
     # ---------- 5 Rules ----------
     Add-DocHeading '5. DLP rules: conditions and actions' 1
@@ -1436,7 +1924,8 @@ function New-DlpWordReport {
     if ($blockNoTip.Count -gt 0) { $cons += "$(Get-Plural $blockNoTip.Count 'blocking rule does' 'blocking rules do') not notify the user. Without a policy tip, users may not understand why their action failed and may contact the service desk." }
     $disabledRules = @($ruleSum | Where-Object { $_.Disabled -eq 'True' })
     if ($disabledRules.Count -gt 0) { $cons += "$(Get-Plural $disabledRules.Count 'rule is' 'rules are') disabled inside otherwise active policies. Confirm this is intentional." }
-    Add-SectionEnd $cons @('DlpReference', 'DlpExchange', 'DlpDeploy')
+    $Script:AreaStatus['Rules'] = $(if ($rules.Count -eq 0) { 'R' } elseif ($respCount['Audit only'] -gt 0) { 'A' } else { 'G' })
+    Add-SectionEnd $cons @('DlpReference', 'DlpExchange', 'DlpDeploy') -Area 'Rules'
 
     # ---------- 6 User experience ----------
     Add-DocHeading '6. User experience: policy tips and overrides' 1
@@ -1459,7 +1948,8 @@ function New-DlpWordReport {
     if ($tips.Count -gt 0 -and $customTip.Count -eq 0) { $cons += 'All policy tips use the default wording. Short, organisation-specific text (what is wrong, what to do, who to contact) is usually better understood.' }
     if ($ovr.Count -gt 0) { $cons += Add-Obs 'User experience' 'Low' "$(Get-Plural $ovr.Count 'rule allows' 'rules allow') overrides. Agree who reviews override justifications and how often, otherwise overrides can become a silent bypass." }
     if ($tips.Count -eq 0 -and $rules.Count -gt 0) { $cons += Add-Obs 'User experience' 'Medium' 'No rules notify users. Users are not being told when they handle sensitive information inappropriately, which removes an important education opportunity.' }
-    Add-SectionEnd $cons @('PolicyTips', 'DlpReference')
+    $Script:AreaStatus['UX'] = $(if ($rules.Count -eq 0 -or $tips.Count -eq 0) { 'R' } elseif ($customTip.Count -eq 0) { 'A' } else { 'G' })
+    Add-SectionEnd $cons @('PolicyTips', 'DlpReference') -Area 'UX'
 
     # ---------- 7 SITs ----------
     Add-DocHeading '7. Sensitive information types' 1
@@ -1476,7 +1966,8 @@ function New-DlpWordReport {
     $cons = @()
     if ($usedNames.Count -eq 0 -and $rules.Count -gt 0) { $cons += 'No sensitive information types are referenced in DLP rules; rules may rely only on labels or other conditions.' }
     $cons += 'Compare the types in use with the organisation''s data inventory. Common gaps include national identifiers, bank account and payment details, internal customer or account references and staff identifiers.'
-    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions')
+    $Script:AreaStatus['SIT'] = $(if ($usedNames.Count -gt 0) { 'G' } else { 'A' })
+    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions') -Area 'SIT'
 
     # ---------- 8 Custom SITs ----------
     Add-DocHeading '8. Custom sensitive information types and keyword dictionaries' 1
@@ -1492,7 +1983,8 @@ function New-DlpWordReport {
     $unused = @($custom | Where-Object { -not $_.UsedInDlpRules })
     if ($unused.Count -gt 0) { $cons += Add-Obs 'Custom SITs' 'Low' "$(Get-Plural $unused.Count 'custom SIT is' 'custom SITs are') not used by any DLP rule: either a policy is missing or the SIT is obsolete." }
     if ($custom.Count -eq 0) { $cons += 'Identify organisation-specific identifiers (customer, account, policy or staff numbers) that need protecting and consider custom SITs for them.' }
-    Add-SectionEnd $cons @('SitCustom', 'KeywordDict')
+    $Script:AreaStatus['CustomSIT'] = $(if ($custom.Count -gt 0 -and $unused.Count -eq 0) { 'G' } else { 'A' })
+    Add-SectionEnd $cons @('SitCustom', 'KeywordDict') -Area 'CustomSIT'
 
     # ---------- 9 EDM ----------
     Add-DocHeading '9. Exact Data Match (EDM)' 1
@@ -1503,7 +1995,8 @@ function New-DlpWordReport {
     if ($edmSits.Count -gt 0) { Add-DocTable -Headers @('EDM sensitive information type', 'Used in DLP') -Widths @(5, 1) -Rows @(foreach ($s in $edmSits) { , @([string]$s.Name, $(if ($s.UsedInDlpRules) { 'Yes' } else { 'No' })) }) }
     $cons = @()
     if ($edm.Count -eq 0) { $cons += 'EDM is not in use. Consider it for well-defined structured datasets such as customer or employee records, where accuracy matters most. Agree data ownership and refresh frequency first.' }
-    Add-SectionEnd $cons @('EdmLearn', 'EdmStart')
+    $Script:AreaStatus['EDM'] = $(if ($edm.Count -gt 0) { 'G' } else { 'A' })
+    Add-SectionEnd $cons @('EdmLearn', 'EdmStart') -Area 'EDM'
 
     # ---------- 10 Trainable classifiers ----------
     Add-DocHeading '10. Trainable classifiers' 1
@@ -1513,7 +2006,8 @@ function New-DlpWordReport {
     else { Add-DocTable -Headers @('Classifier', 'Policy', 'Rule') -Widths @(3, 2.5, 2.5) -Rows @(foreach ($t in $tc) { , @([string]$t.Name, [string]$t.Policy, [string]$t.Rule) }) -MaxRows 30 }
     Add-DocCallout 'Note:' 'There is no supported PowerShell command to list every classifier available in the tenant. Review the full list in the Microsoft Purview portal under Data classification > Classifiers.'
     $cons = @('Test relevant classifiers against representative documents before using them to block, as accuracy varies by content type.')
-    Add-SectionEnd $cons @('Classifiers')
+    $Script:AreaStatus['Classifiers'] = $(if ($tc.Count -gt 0) { 'G' } else { 'A' })
+    Add-SectionEnd $cons @('Classifiers') -Area 'Classifiers'
 
     # ---------- 11 Confidence ----------
     Add-DocHeading '11. Confidence levels and instance counts' 1
@@ -1528,7 +2022,8 @@ function New-DlpWordReport {
     $blockRules = @($ruleSum | Where-Object { $_.ResponseInterpretation -like 'Block*' } | Select-Object -ExpandProperty Rule)
     $blockSingle = @($single | Where-Object { $blockRules -contains $_.Rule })
     if ($blockSingle.Count -gt 0) { $cons += "$(Get-Plural $blockSingle.Count 'blocking detection triggers' 'blocking detections trigger') on a single instance. Confirm this is intended; a single match is more likely to be a false positive." }
-    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions')
+    $Script:AreaStatus['Confidence'] = $(if ($classRefs.Count -eq 0) { 'N' } elseif ($lowConf.Count -gt 0) { 'A' } else { 'G' })
+    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions') -Area 'Confidence'
 
     # ---------- 12 Labels ----------
     Add-DocHeading '12. Sensitivity labels and DLP' 1
@@ -1549,7 +2044,8 @@ function New-DlpWordReport {
     elseif ($labelRefs.Count -eq 0) { $cons += Add-Obs 'Sensitivity labels' 'Medium' 'Sensitivity labels exist but are not used in any DLP rule. Using them as conditions (for example blocking external sharing of Highly Confidential content) is a simple, explainable control.' }
     if ($labels.Count -gt 0 -and $labelPol.Count -eq 0) { $cons += Add-Obs 'Sensitivity labels' 'High' 'Labels exist but no label policy publishes them, so users cannot apply them.' }
     if ($labels.Count -gt 0 -and $autoPol.Count -eq 0 -and -not (Get-StepGap 'Auto-labelling policies')) { $cons += 'No auto-labelling policies are configured. Relying entirely on users to label content usually leads to inconsistent labelling.' }
-    Add-SectionEnd $cons @('Labels', 'AutoLabel', 'LabelCondition')
+    $Script:AreaStatus['Labels'] = $(if ($labelRefs.Count -gt 0 -and $labelPol.Count -gt 0) { 'G' } elseif ($labels.Count -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('Labels', 'AutoLabel', 'LabelCondition') -Area 'Labels'
 
     # ---------- 13 Endpoint ----------
     Add-DocHeading '13. Endpoint DLP (devices)' 1
@@ -1579,7 +2075,8 @@ function New-DlpWordReport {
         if ($prn.Count -eq 0) { $cons += 'No rule restricts printing of sensitive files. Identify business processes that genuinely require printing before adding controls.' }
         if ($upl.Count -eq 0) { $cons += 'No rule restricts browser or cloud uploads. Define approved service domains and browsers, then consider warning or blocking uploads elsewhere.' }
     }
-    Add-SectionEnd $cons @('EndpointLearn', 'EndpointSettings', 'EndpointUsing')
+    $Script:AreaStatus['Endpoint'] = $(if ($covCount['Endpoint'] -gt 0 -and $usb.Count -gt 0) { 'G' } elseif ($covCount['Endpoint'] -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('EndpointLearn', 'EndpointSettings', 'EndpointUsing') -Area 'Endpoint'
 
     # ---------- 14 Copilot ----------
     Add-DocHeading '14. DLP for Microsoft 365 Copilot' 1
@@ -1590,7 +2087,8 @@ function New-DlpWordReport {
     $cons = @()
     if ($cp.Count -eq 0) { $cons += Add-Obs 'Copilot' 'Medium' 'No DLP policy covers Microsoft 365 Copilot. If Copilot is deployed or planned, consider a policy that excludes highly confidential labelled content from Copilot responses.' }
     $cons += 'Copilot location detection uses pattern matching on policy locations. If a Copilot policy is missing here, confirm in the Purview portal.'
-    Add-SectionEnd $cons @('Copilot')
+    $Script:AreaStatus['Copilot'] = $(if ($covCount['Copilot'] -gt 0) { 'G' } elseif ($cp.Count -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('Copilot') -Area 'Copilot'
 
     # ---------- 15 Deployment ----------
     Add-DocHeading '15. Deployment state and simulation' 1
@@ -1602,7 +2100,8 @@ function New-DlpWordReport {
         , @('Disabled', [string]$pOff)
     )
     $cons = @('Agree policy waves, pilot groups, acceptance criteria (for example an acceptable false-positive rate) and enforcement dates for each policy.')
-    Add-SectionEnd $cons @('DlpSimulation', 'DlpSimStart', 'DlpDeploy')
+    $Script:AreaStatus['Simulation'] = $(if ($pEnf -gt 0) { 'G' } elseif ($policies.Count -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('DlpSimulation', 'DlpSimStart', 'DlpDeploy') -Area 'Simulation'
 
     # ---------- 16 Alerts ----------
     Add-DocHeading '16. Alerts and monitoring' 1
@@ -1618,7 +2117,8 @@ function New-DlpWordReport {
     $siteOnly = @($ruleAlert | Where-Object { ([string]$_.GenerateAlert + [string]$_.GenerateIncidentReport) -match '^(SiteAdmin\s*\|?\s*)+$' })
     if ($siteOnly.Count -gt 0) { $cons += Add-Obs 'Alerts' 'Medium' "$(Get-Plural $siteOnly.Count 'rule sends' 'rules send') alerts only to SiteAdmin. Route alerts to a named team or shared mailbox with a defined triage process." }
     $cons += 'Define alert severity, recipients, investigation steps and escalation routes, and who reviews override justifications.'
-    Add-SectionEnd $cons @('Alerts')
+    $Script:AreaStatus['Alerts'] = $(if ($ruleAlert.Count -gt 0 -and $siteOnly.Count -eq 0) { 'G' } elseif ($ruleAlert.Count -gt 0) { 'A' } else { 'R' })
+    Add-SectionEnd $cons @('Alerts') -Area 'Alerts'
 
     # ---------- 17 Activity Explorer ----------
     Add-DocHeading '17. Activity Explorer' 1
@@ -1631,7 +2131,8 @@ function New-DlpWordReport {
         $grp = @($act | Group-Object { '{0}|{1}' -f (Get-Val $_ 'Activity'), (Get-Val $_ 'Workload') } | Sort-Object Count -Descending)
         if ($grp.Count) { Add-DocTable -Headers @('Activity', 'Workload', 'Count') -Widths @(4, 2.5, 1) -Rows @(foreach ($g in $grp) { $p = $g.Name -split '\|', 2; , @($p[0], $p[1], [string]$g.Count) }) -MaxRows 25 -Note 'Detail: 60_Activity_Explorer_Records (contains user and file names).' }
     }
-    Add-SectionEnd @('Agree a regular review of Activity Explorer (for example weekly during rollout, then monthly) and the operational reports stakeholders need.') @('ActivityExplorer')
+    $Script:AreaStatus['Activity'] = $(if ($Script:Cache.ContainsKey('Activity')) { 'G' } else { 'N' })
+    Add-SectionEnd @('Agree a regular review of Activity Explorer (for example weekly during rollout, then monthly) and the operational reports stakeholders need.') @('ActivityExplorer') -Area 'Activity'
 
     # ---------- 18 Exchange ----------
     $cons = @()
@@ -1648,7 +2149,8 @@ function New-DlpWordReport {
         if ($trSit.Count -gt 0) { $cons += Add-Obs 'Exchange' 'Medium' "$(Get-Plural $trSit.Count 'mail flow rule inspects' 'mail flow rules inspect') sensitive information. Consider migrating this logic to Purview DLP so all data protection is managed in one place." }
         if ($aud.Count -and -not $aud[0].UnifiedAuditLogIngestionEnabled) { $cons += Add-Obs 'Auditing' 'High' 'The unified audit log is disabled. DLP reporting, Activity Explorer and investigations depend on it.' }
     }
-    Add-SectionEnd $cons @('MailFlow', 'DlpExchange')
+    $Script:AreaStatus['Exchange'] = $(if (-not $Script:Cache.ContainsKey('TransportRules')) { 'N' } elseif ($Script:Cache.ContainsKey('Audit') -and @($Script:Cache['Audit']).Count -and -not @($Script:Cache['Audit'])[0].UnifiedAuditLogIngestionEnabled) { 'R' } elseif (@(@($Script:Cache['TransportRules']) | Where-Object { Get-Val $_ 'MessageContainsDataClassifications' }).Count -gt 0) { 'A' } else { 'G' })
+    Add-SectionEnd $cons @('MailFlow', 'DlpExchange') -Area 'Exchange'
     $cons = @()
 
     # ---------- 19 Ownership ----------
@@ -1662,12 +2164,23 @@ function New-DlpWordReport {
     $cons = @('Create a responsibility matrix covering security, compliance, IT, legal, HR and business owners: who owns each policy, who triages alerts, who approves exceptions and changes.')
     $uniq = @($roleMembers | Select-Object -ExpandProperty Member -Unique)
     if ($uniq.Count -gt 15) { $cons += Add-Obs 'Ownership' 'Low' "$($uniq.Count) people or groups hold DLP-relevant roles. Review whether all still need them." }
-    Add-SectionEnd $cons @('Permissions')
+    $Script:AreaStatus['Ownership'] = $(if ($roleMembers.Count -gt 0) { 'G' } else { 'N' })
+    Add-SectionEnd $cons @('Permissions') -Area 'Ownership'
 
     # ---------- 20 Next steps ----------
     Add-DocHeading '20. Recommended next steps' 1
     Add-DocPara 'The table below lists suggested activities for each DLP topic, with the automated finding from this assessment. Use it as the starting point for the engagement plan; the same content, with Status, Owner and Target date columns, is in 00_Assessment_Summary.csv.'
     if ($summaryRows.Count) { Add-DocTable -Headers @('Topic', 'Finding', 'Suggested activity') -Widths @(2, 3.5, 3) -FontSize 16 -Rows @(foreach ($s in $summaryRows) { , @([string]$s.Topic, [string]$s.Finding, [string]$s.SuggestedActivity) }) }
+
+    # ---------- 21 Applying the configuration ----------
+    $auditOff = [bool]($Script:Cache.ContainsKey('Audit') -and @($Script:Cache['Audit']).Count -and -not @($Script:Cache['Audit'])[0].UnifiedAuditLogIngestionEnabled)
+    $ctx = @{
+        Gaps = @($gaps); Policies = $policies.Count; Test = $pTest; AuditOnly = $respCount['Audit only']; Rules = $rules.Count; Tips = $tips.Count
+        Labels = $labels.Count; LabelPolicies = $labelPol.Count; LabelRefs = $labelRefs.Count; EndpointCov = $covCount['Endpoint']; Usb = $usb.Count
+        CopilotCov = $covCount['Copilot']; AlertRules = $ruleAlert.Count; SiteOnly = $siteOnly.Count; LowConf = $lowConf.Count; Custom = $custom.Count
+        Edm = $edm.Count; AuditOff = $auditOff
+    }
+    Add-ImplementationGuidance -Ctx $ctx
 
     # ---------- Appendices ----------
     Add-DocHeading 'Appendix A: Collection details' 1
@@ -1724,6 +2237,8 @@ function New-DlpWordReport {
         , @('99_Collection_Errors', 'Steps skipped or failed')
     )
 
+    Add-FrameworkAppendix
+
     # ---------- insert executive observations ----------
     $obsXml = [System.Text.StringBuilder]::new()
     $saved = $Script:Doc.Body; $Script:Doc.Body = $obsXml
@@ -1751,6 +2266,12 @@ function New-DlpWordReport {
         , @('Alerting', $(if (@($ruleSum | Where-Object { $_.GenerateAlert -or $_.GenerateIncidentReport }).Count) { 'Configured' } else { 'Not configured' }))
     )
     Add-DocTable -Headers @('Area', 'Status') -Widths @(3, 3) -Rows $statusRows
+    if (@(Get-SelectedFrameworks).Count -gt 0) {
+        Add-DocHeading 'Framework alignment at a glance' 2
+        Add-DocPara 'How each area of the DLP configuration supports recognised security frameworks. Each area section repeats its row with a plain-English description of what the framework expects; Appendix D explains the frameworks and status values.'
+        Add-FrameworkMatrix
+        Add-DocPara 'Indicative mapping, not a compliance assessment. Section 21 gives guidance for closing the gaps.' -Size 16 -Color '666666' -Italic
+    }
     $Script:Doc.Body = $saved
     [void]$Script:Doc.Body.Insert($execObsAnchor, $obsXml.ToString())
 
@@ -2042,6 +2563,7 @@ function Show-SettingsMenu {
         Write-Host "   6. Include Exchange Online in full    : $($Script:Settings.IncludeExchange)"
         Write-Host "   7. Sign in with -DisableWAM           : $($Script:Settings.DisableWAM)  (use if sign-in fails or the sign-in window does not appear)"
         Write-Host "   8. Word report with complete report   : $($Script:Settings.WordReport)  (DLP_Assessment_Report.docx)"
+        Write-Host "   9. Frameworks in Word report           : $(($Script:Settings.Frameworks) -join ', ')  (NCSC, NISTCSF, NIST80053, ISO27001, All, None)"
         Write-Host '   B. Back'
         $s = Read-Host '  Choose'
         switch ($s.Trim().ToUpper()) {
@@ -2053,6 +2575,7 @@ function Show-SettingsMenu {
             '6' { $Script:Settings.IncludeExchange = -not $Script:Settings.IncludeExchange }
             '7' { $Script:Settings.DisableWAM = -not $Script:Settings.DisableWAM }
             '8' { $Script:Settings.WordReport = -not $Script:Settings.WordReport }
+            '9' { $f = Read-Host '  Frameworks (comma separated)'; if ($f) { $Script:Settings.Frameworks = @($f -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } }
             'B' { return }
         }
     }

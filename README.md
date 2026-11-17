@@ -132,7 +132,7 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 | **3. Test credentials and tenant access** | Runs a minimal read-only call against every cmdlet the reports use and shows **PASS**, **MISSING** (role or licence missing) or **FAIL** per area. Lists the account's Purview role groups and saves the results to CSV. Optionally tests Exchange Online. |
 | **4. Report on individual DLP items** | Choose one or more of the 12 [report areas](#report-areas), for example `2,3,8`. |
 | **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report and the Excel workbook. Asks whether to include Activity Explorer and Exchange Online. |
-| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, and whether to create the Word report. |
+| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, whether to create the Word report, and which frameworks it references. |
 | **7. Disconnect / switch tenant** | Signs out so you can move to the next customer tenant without restarting. |
 
 Once connected, the connection is re-used by every option. Options 3–5 connect automatically if you have not used option 2.
@@ -191,6 +191,7 @@ foreach ($t in $tenants) {
 | `-ActivityMaxPages` | `20` | Cap on 5,000-record Activity Explorer pages (1–200) |
 | `-IncludeExchange` | Off | Include Exchange Online in the complete report and access test |
 | `-DisableWAM` | Off | Sign in through the browser instead of the Windows account broker |
+| `-Frameworks` | All four | Frameworks referenced in the Word report: `NCSC`, `NISTCSF`, `NIST80053`, `ISO27001`, `NIST`, `ISO`, `All` or `None` |
 | `-NoWordReport` | Off | Do not create the Word assessment report with the complete report |
 | `-NoDisconnect` | Off | Leave the session connected when the script ends |
 
@@ -283,7 +284,7 @@ Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Asses
 |---|---|
 | Cover and contents | Organisation, tenant ID, collection date, account used, method, confidentiality note |
 | 1. About this report | Purpose, how the data was collected (read-only), how sections are organised |
-| 2. Executive summary | Headline figures, **key observations** ranked High / Medium / Low, collection gaps, **status by area** |
+| 2. Executive summary | Headline figures, **key observations** ranked High / Medium / Low, collection gaps, **status by area**, **framework alignment at a glance** |
 | 3. DLP policies | Each policy with mode, locations, rule count and last change date |
 | 4. Where DLP is applied | Exchange, SharePoint, OneDrive, Teams, devices, Copilot and other locations: covered or not |
 | 5. DLP rules | How rules respond (block, block with override, notify, endpoint restrictions, audit only) and a table of rules |
@@ -302,7 +303,8 @@ Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Asses
 | 18. Exchange mail flow and auditing | Legacy mail flow rules and unified audit log status (when Exchange Online is included) |
 | 19. Operational ownership | Role groups and members with DLP-relevant roles |
 | 20. Recommended next steps | Topic, finding and suggested activity for every DLP topic |
-| Appendices | Collection details and gaps, glossary, list of evidence files |
+| 21. Applying the configuration | Order of work and step-by-step guidance for each gap found |
+| Appendices | Collection details and gaps, glossary, evidence files, framework references |
 
 ### How each area section is laid out
 
@@ -314,6 +316,7 @@ Sections 3 to 19 all use the same layout:
 | **Why it matters** | How the feature helps protect information |
 | **What we found** | The tenant's configuration, with counts and tables. Areas that could not be fully read are flagged in an orange **Not fully collected** box |
 | **Things to consider** | Observations generated from the data, plus good-practice prompts |
+| **Framework alignment** | NCSC, NIST and ISO 27001 references, what each expects, and the tenant status |
 | **Learn more** | Clickable links to the relevant Microsoft Learn pages |
 
 Long tables are shortened in the report (typically to the first 40 or 60 rows) with a pointer to the CSV file that holds the full data.
@@ -330,6 +333,54 @@ Observations come from simple, transparent checks on the collected configuration
 
 > Observations are prompts for discussion, generated from configuration alone. They do not know the organisation's risk appetite, licensing or plans. Review and agree priorities with the customer before presenting them as recommendations.
 
+### Framework alignment (NCSC, NIST, ISO 27001)
+
+The report links every area of DLP configuration to recognised security frameworks, so findings can be read against the organisation's compliance obligations:
+
+| Framework | Main references used |
+|---|---|
+| **NCSC** Cyber Assessment Framework v4.0 and 10 Steps | B3 Data security (B3.a Understanding data, B3.b Data in transit, B3.c Stored data, B3.d Mobile data), B6 Staff awareness, C1 Security monitoring, A1 Governance |
+| **NIST CSF 2.0** | PR.DS-01 data at rest, PR.DS-02 data in transit, PR.DS-10 data in use, ID.AM-07 data inventory, DE.CM-03 monitoring |
+| **NIST SP 800-53 Rev. 5** | AC-4 Information flow enforcement, SC-7(10) Prevent exfiltration, MP-7 Media use, AC-16 Security attributes, SI-4, AU-13 |
+| **ISO/IEC 27001:2022** | 8.12 Data leakage prevention, 5.12 Classification, 5.13 Labelling, 5.14 Information transfer, 7.10 Storage media, 8.16 Monitoring |
+
+References appear in three places:
+
+- **Executive summary: Framework alignment at a glance.** One row per area, one column per framework, and a colour-coded status for the tenant: Supported (green), Partial (amber), Gap (red), Not assessed (grey).
+- **Each area section: Framework alignment.** The framework, the reference, **what the framework expects in plain English**, and the tenant status.
+- **Appendix D: Framework references.** What each framework is, links to the source, and the status definitions.
+
+Choose which frameworks appear with **Settings > 9** or `-Frameworks` (`NCSC`, `NISTCSF`, `NIST80053`, `ISO27001`, or `NIST`, `ISO`, `All`, `None`). The default is all four.
+
+```powershell
+.\Get-M365DlpConfiguration.ps1 -Mode Full -UserPrincipalName admin@contoso.onmicrosoft.com -Frameworks NCSC,ISO27001
+```
+
+> The mapping is indicative, not a compliance assessment. Framework outcomes also depend on policies, processes and people the script cannot see. Confirm references against the framework documents before using them in formal assurance work.
+
+### Applying the configuration (section 21)
+
+Section 21 of the report turns findings into practical guidance. It starts with a recommended order of work, then includes a guidance block **only for the gaps found in that tenant**:
+
+| Guidance | Included when |
+|---|---|
+| Create or extend DLP policies to all core locations | No policies, or a core location has no enforced policy |
+| Move policies from simulation to enforcement | Policies are in simulation or test mode |
+| Add policy tips and proportionate actions | Rules only audit, or no rule notifies users |
+| Define and publish sensitivity labels | No labels, or labels not published |
+| Use sensitivity labels as DLP conditions | Labels exist but no rule uses them |
+| Onboard devices and restrict USB, printing and uploads | No enforced device policy, or no USB restriction |
+| Protect Microsoft 365 Copilot interactions | No Copilot DLP policy |
+| Configure alerts and a review process | No alerting rules, or alerts only to SiteAdmin |
+| Tune confidence levels and instance counts | Low-confidence detections |
+| Create custom sensitive information types | No custom SITs |
+| Consider Exact Data Match | EDM not in use |
+| Turn on the unified audit log | Exchange data collected and auditing disabled |
+
+Each block shows **why it applies**, the **framework references** it supports, **numbered steps in the Microsoft Purview portal**, a **PowerShell example** to adapt, **how to check it worked**, and **Microsoft Learn** links.
+
+> The PowerShell examples are starting points. Replace the example names, sensitive information types, label GUIDs and recipients, create policies in simulation mode first, and follow the customer's change process.
+
 ### Microsoft Learn links
 
 Each section links to the relevant Microsoft Learn documentation: data loss prevention, policy reference, simulation mode, policy tips, sensitive information types and entity definitions, custom SITs, keyword dictionaries, Exact Data Match, trainable classifiers, sensitivity labels, auto-labelling, labels as DLP conditions, Endpoint DLP and its settings, DLP for Microsoft 365 Copilot, DLP alerts, Activity Explorer, Purview permissions and Exchange mail flow rules.
@@ -343,6 +394,8 @@ All links are kept in one table (`$Script:LearnLinks`) near the start of the Wor
 | Wording, branding, logo, extra commentary | Edit the generated document in Word |
 | Microsoft Learn links | `$Script:LearnLinks` in the script |
 | Section explanations and observation logic | `New-DlpWordReport` in the script (one commented block per section) |
+| Framework references | `$Script:FrameworkMap` and `$Script:FrameworkInfo` in the script |
+| Configuration guidance | `Add-ImplementationGuidance` in the script |
 | How many rows a table shows | The `-MaxRows` value on each `Add-DocTable` call |
 
 ### Sharing
