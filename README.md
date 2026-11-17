@@ -40,7 +40,9 @@ It is built for consultants and administrators who need a consistent evidence pa
 | Activity Explorer *(optional)* | DLP rule matches and other activity for the last 1–30 days |
 | Exchange Online *(optional)* | Mail flow rules (including legacy Exchange DLP) and unified audit log status |
 
-A complete run also produces an **assessment summary**: one row per DLP topic with an automatically calculated finding, the file that holds the evidence, a suggested next activity, and blank Status / Owner / TargetDate / Notes columns ready to use as an engagement tracker.
+A complete run also produces a **Word assessment report** (`DLP_Assessment_Report.docx`): a plain-English document that explains what each DLP feature is and why it matters, shows what was found in the tenant, lists things to consider, and links to the relevant Microsoft Learn pages. It is built directly by the script; Microsoft Word and extra modules are not required.
+
+It also produces an **assessment summary**: one row per DLP topic with an automatically calculated finding, the file that holds the evidence, a suggested next activity, and blank Status / Owner / TargetDate / Notes columns ready to use as an engagement tracker.
 
 ---
 
@@ -128,8 +130,8 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 | **2. Connect to tenant** | Signs in to Security & Compliance PowerShell, or switches to a different account or tenant. Shows the account, tenant ID and organisation, and how many key DLP cmdlets the account can use. |
 | **3. Test credentials and tenant access** | Runs a minimal read-only call against every cmdlet the reports use and shows **PASS**, **MISSING** (role or licence missing) or **FAIL** per area. Lists the account's Purview role groups and saves the results to CSV. Optionally tests Exchange Online. |
 | **4. Report on individual DLP items** | Choose one or more of the 12 [report areas](#report-areas), for example `2,3,8`. |
-| **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML) and Excel workbook. Asks whether to include Activity Explorer and Exchange Online. |
-| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, and sign-in with `-DisableWAM`. |
+| **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report and the Excel workbook. Asks whether to include Activity Explorer and Exchange Online. |
+| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, and whether to create the Word report. |
 | **7. Disconnect / switch tenant** | Signs out so you can move to the next customer tenant without restarting. |
 
 Once connected, the connection is re-used by every option. Options 3–5 connect automatically if you have not used option 2.
@@ -188,6 +190,7 @@ foreach ($t in $tenants) {
 | `-ActivityMaxPages` | `20` | Cap on 5,000-record Activity Explorer pages (1–200) |
 | `-IncludeExchange` | Off | Include Exchange Online in the complete report and access test |
 | `-DisableWAM` | Off | Sign in through the browser instead of the Windows account broker |
+| `-NoWordReport` | Off | Do not create the Word assessment report with the complete report |
 | `-NoDisconnect` | Off | Leave the session connected when the script ends |
 
 Full help: `Get-Help .\Get-M365DlpConfiguration.ps1 -Detailed`
@@ -227,6 +230,7 @@ Inside each folder:
 
 | File | Description |
 |---|---|
+| `DLP_Assessment_Report.docx` | Complete report only. Plain-English Word report: executive summary, key observations, an explanation and findings for every area, Microsoft Learn links, glossary |
 | `00_Assessment_Summary.html` / `.csv` | Complete report only. One row per topic with findings and tracker columns |
 | `DLP_Configuration.xlsx` | Every dataset as a filterable worksheet (requires ImportExcel) |
 | `NN_Name.csv` | Flattened data for each dataset |
@@ -251,6 +255,19 @@ Import-Csv .\21_Sensitive_Information_Types_Custom.csv | Where-Object UsedInDlpR
 ```
 
 > Activity Explorer output contains user names, file names and paths. Store and share it according to the customer's data-handling requirements.
+
+---
+
+### The Word assessment report
+
+`DLP_Assessment_Report.docx` is written for stakeholders who are not DLP specialists. It contains:
+
+- **Executive summary:** headline figures, key observations ranked High / Medium / Low, and a status-by-area table
+- **A section for every area:** DLP policies, locations covered, rules and actions, policy tips and overrides, sensitive information types, custom SITs and keyword dictionaries, Exact Data Match, trainable classifiers, confidence levels, sensitivity labels, Endpoint DLP (USB, printing, browser and cloud uploads), Microsoft 365 Copilot, simulation and deployment state, alerts, Activity Explorer, Exchange mail flow and auditing, and operational ownership
+- Each section explains **What is it?**, **Why it matters**, **What we found** (with the tenant's data), **Things to consider**, and **Learn more** links to Microsoft Learn
+- **Recommended next steps**, collection details, a glossary and a list of evidence files
+
+When you open it, choose **Yes** when Word asks to update fields so the table of contents is built. Observations are generated automatically from the configuration and are a starting point for discussion, not a substitute for review.
 
 ---
 
