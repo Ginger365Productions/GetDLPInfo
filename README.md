@@ -17,6 +17,7 @@ It is built for consultants and administrators who need a consistent evidence pa
 - [Running without the menu](#running-without-the-menu)
 - [Report areas](#report-areas)
 - [Output](#output)
+- [Word assessment report](#word-assessment-report)
 - [Permissions](#permissions)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -258,16 +259,99 @@ Import-Csv .\21_Sensitive_Information_Types_Custom.csv | Where-Object UsedInDlpR
 
 ---
 
-### The Word assessment report
+## Word assessment report
 
-`DLP_Assessment_Report.docx` is written for stakeholders who are not DLP specialists. It contains:
+Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Assessment_Report.docx`** in the output folder. It is a plain-English report for stakeholders who are not DLP specialists. It explains what each part of Microsoft Purview DLP is and why it matters, shows what is configured in the tenant, highlights things to consider, and links to the relevant Microsoft Learn pages.
 
-- **Executive summary:** headline figures, key observations ranked High / Medium / Low, and a status-by-area table
-- **A section for every area:** DLP policies, locations covered, rules and actions, policy tips and overrides, sensitive information types, custom SITs and keyword dictionaries, Exact Data Match, trainable classifiers, confidence levels, sensitivity labels, Endpoint DLP (USB, printing, browser and cloud uploads), Microsoft 365 Copilot, simulation and deployment state, alerts, Activity Explorer, Exchange mail flow and auditing, and operational ownership
-- Each section explains **What is it?**, **Why it matters**, **What we found** (with the tenant's data), **Things to consider**, and **Learn more** links to Microsoft Learn
-- **Recommended next steps**, collection details, a glossary and a list of evidence files
+- The script builds the document itself. **Microsoft Word and extra PowerShell modules are not required** on the machine that runs it.
+- It is created from the same data, in the same run, as the CSV, JSON and Excel outputs, so everything is consistent.
+- It is **on by default**. Turn it off with **Settings > 8** or the `-NoWordReport` parameter.
+- It is only produced by the complete report, because it needs data from every area. Individual area reports (option 4) do not create it.
+- If report generation fails, the rest of the output is still written, and the error is logged in `Collection.log` and `99_Collection_Errors.csv`.
 
-When you open it, choose **Yes** when Word asks to update fields so the table of contents is built. Observations are generated automatically from the configuration and are a starting point for discussion, not a substitute for review.
+### Opening the report
+
+1. Open `DLP_Assessment_Report.docx` from the `M365-DLP-Full-yyyyMMdd-HHmmss` folder.
+2. If Word opens it in Protected View, select **Enable Editing**.
+3. When Word asks whether to update fields, select **Yes**. This builds the table of contents and page numbers.
+   If you are not prompted, right-click the Contents page and choose **Update Field > Update entire table**.
+4. Save. The report is a normal Word document: brand it, add commentary, or export it to PDF (**File > Export > Create PDF**).
+
+### What the report contains
+
+| Section | Contents |
+|---|---|
+| Cover and contents | Organisation, tenant ID, collection date, account used, method, confidentiality note |
+| 1. About this report | Purpose, how the data was collected (read-only), how sections are organised |
+| 2. Executive summary | Headline figures, **key observations** ranked High / Medium / Low, collection gaps, **status by area** |
+| 3. DLP policies | Each policy with mode, locations, rule count and last change date |
+| 4. Where DLP is applied | Exchange, SharePoint, OneDrive, Teams, devices, Copilot and other locations: covered or not |
+| 5. DLP rules | How rules respond (block, block with override, notify, endpoint restrictions, audit only) and a table of rules |
+| 6. User experience | Policy tips, custom tip text and overrides |
+| 7. Sensitive information types | Detectors in use and the policies that use them |
+| 8. Custom SITs and keyword dictionaries | Organisation-specific detectors and whether they are used |
+| 9. Exact Data Match | EDM schemas and EDM-based detectors |
+| 10. Trainable classifiers | Machine-learning classifiers referenced by rules |
+| 11. Confidence levels and instance counts | Detection thresholds, low-confidence and single-instance detections |
+| 12. Sensitivity labels and DLP | Label taxonomy, encryption, label policies, auto-labelling, labels used in DLP |
+| 13. Endpoint DLP | USB and removable storage, printing, browser and cloud uploads, tenant-wide device settings |
+| 14. DLP for Microsoft 365 Copilot | Policies protecting Copilot and Copilot Chat |
+| 15. Deployment state and simulation | Enforced, simulation and disabled policies |
+| 16. Alerts and monitoring | Rules that raise alerts or incident reports, and who receives them |
+| 17. Activity Explorer | Activity summary (when Activity Explorer is included in the run) |
+| 18. Exchange mail flow and auditing | Legacy mail flow rules and unified audit log status (when Exchange Online is included) |
+| 19. Operational ownership | Role groups and members with DLP-relevant roles |
+| 20. Recommended next steps | Topic, finding and suggested activity for every DLP topic |
+| Appendices | Collection details and gaps, glossary, list of evidence files |
+
+### How each area section is laid out
+
+Sections 3 to 19 all use the same layout:
+
+| Part | What it gives the reader |
+|---|---|
+| **What is it?** | A short, non-technical explanation, for example what a sensitivity label or a sensitive information type is |
+| **Why it matters** | How the feature helps protect information |
+| **What we found** | The tenant's configuration, with counts and tables. Areas that could not be fully read are flagged in an orange **Not fully collected** box |
+| **Things to consider** | Observations generated from the data, plus good-practice prompts |
+| **Learn more** | Clickable links to the relevant Microsoft Learn pages |
+
+Long tables are shortened in the report (typically to the first 40 or 60 rows) with a pointer to the CSV file that holds the full data.
+
+### Observations and priorities
+
+Observations come from simple, transparent checks on the collected configuration. For example:
+
+| Priority | Example checks |
+|---|---|
+| **High** | No DLP policies; a core location (Exchange, SharePoint, OneDrive, Teams, devices) with no enforced policy; no sensitivity labels, or labels not published; no rules raising alerts; unified audit log disabled |
+| **Medium** | Policies left in simulation; rules that only audit; high-severity rules without alerts; low-confidence detections; labels not used in DLP; device policies without USB restrictions; no Copilot policy; alerts sent only to SiteAdmin; legacy mail flow rules inspecting sensitive information |
+| **Low** | Disabled or stale policies; rules allowing overrides; unused custom SITs; a large number of people holding DLP roles |
+
+> Observations are prompts for discussion, generated from configuration alone. They do not know the organisation's risk appetite, licensing or plans. Review and agree priorities with the customer before presenting them as recommendations.
+
+### Microsoft Learn links
+
+Each section links to the relevant Microsoft Learn documentation: data loss prevention, policy reference, simulation mode, policy tips, sensitive information types and entity definitions, custom SITs, keyword dictionaries, Exact Data Match, trainable classifiers, sensitivity labels, auto-labelling, labels as DLP conditions, Endpoint DLP and its settings, DLP for Microsoft 365 Copilot, DLP alerts, Activity Explorer, Purview permissions and Exchange mail flow rules.
+
+All links are kept in one table (`$Script:LearnLinks`) near the start of the Word report region of the script, so a page that Microsoft moves is a one-line fix.
+
+### Customising
+
+| To change | Where |
+|---|---|
+| Wording, branding, logo, extra commentary | Edit the generated document in Word |
+| Microsoft Learn links | `$Script:LearnLinks` in the script |
+| Section explanations and observation logic | `New-DlpWordReport` in the script (one commented block per section) |
+| How many rows a table shows | The `-MaxRows` value on each `Add-DocTable` call |
+
+### Sharing
+
+- The report describes how sensitive information is protected. Treat it as confidential to the customer.
+- Appendix A lists the admin account used and any collection gaps. Remove it if sharing beyond the project team.
+- If Activity Explorer was included, the underlying CSV contains user and file names. Do not share it more widely than the report.
+
+Section 6 of the [user guide](M365-DLP-Discovery-Script-User-Guide.docx) has sample screens of every part of the report.
 
 ---
 
@@ -300,6 +384,9 @@ Some features also need licences. For example, auto-labelling, Endpoint DLP, Tea
 | A step shows `WARN ... skipped - Cmdlet(s) not available`, e.g. `Get-AutoSensitivityLabelPolicy` | The account lacks the role for that area, or the tenant is not licensed for the feature. Run option 3, add the role, wait up to an hour and re-run. |
 | Option 3 shows FAIL for Activity Explorer | Add the account to Information Protection Analysts (or Investigators). |
 | Menu opens when you expected the script to run straight through | Add `-Mode Full`, `-Mode Area` or `-Mode TestAccess`. |
+| Word report contents page says "Right-click here and choose Update Field" | Select **Enable Editing** if in Protected View, then right-click the contents and choose **Update Field > Update entire table**. |
+| `Word report failed` in the log and no `DLP_Assessment_Report.docx` | The rest of the output is complete. Check `Collection.log`, then re-run option 5. Turn the report off with Settings > 8 if needed. |
+| Word report says Activity Explorer or Exchange data was not included | Re-run option 5 and answer Yes to those prompts. |
 | No Excel workbook | Install ImportExcel (option 1), or use the CSV files. |
 | "Not connected" after an Exchange Online area | Expected. The script disconnects Exchange Online to avoid cmdlet name clashes and reconnects to Security & Compliance automatically. |
 
@@ -317,4 +404,4 @@ Some features also need licences. For example, auto-labelling, Endpoint DLP, Tea
 
 ## Documentation
 
-A full user guide, including screen examples, sample output for every dataset and a complete dataset reference, is in [`M365-DLP-Discovery-Script-User-Guide.docx`](M365-DLP-Discovery-Script-User-Guide.docx).
+A full user guide, including screen examples, sample output for every dataset, sample pages of the Word assessment report and a complete dataset reference, is in [`M365-DLP-Discovery-Script-User-Guide.docx`](M365-DLP-Discovery-Script-User-Guide.docx).
