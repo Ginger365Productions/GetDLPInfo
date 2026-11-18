@@ -6,6 +6,8 @@ It is built for consultants and administrators who need a consistent evidence pa
 
 > **Read-only:** the script only calls `Get-*` and `Export-*` cmdlets. It never creates, changes, enables or deletes anything in the tenant. The only files it writes are its output files on your workstation.
 
+> **Beta available:** a beta version with optional **Microsoft Graph** data (licensing for DLP features, DLP alerts raised, Microsoft Entra role holders and SharePoint sharing settings) is in the [`beta`](beta/README.md) folder. The script in this root folder is the main, supported version.
+
 ---
 
 ## Contents
