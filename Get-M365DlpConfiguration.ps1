@@ -11,7 +11,8 @@
       3. Test credentials and tenant access (checks every cmdlet the reports need)
       4. Report on individual DLP items (choose one or more areas)
       5. Complete tenant DLP report (every area plus an assessment summary)
-      6. Settings (output folder, Activity Explorer, Exchange Online)
+      6. Settings (output folder, Activity Explorer, Exchange Online, Content Explorer, DLP rule activity,
+         customer name, assessor, logo, comparison with a previous report)
       7. Disconnect / switch tenant
 
     Areas available as individual reports:
@@ -27,11 +28,17 @@
       10  Operational ownership - Purview role groups and members
       11  Activity Explorer (activity data for the last N days)
       12  Exchange Online mail flow rules and audit configuration
+      13  Content Explorer - how many stored items contain each sensitive information type / label
+      14  DLP rule activity from the unified audit log - matches, overrides, false positives
 
     Output for each report run goes to a new time-stamped folder:
       CSV + JSON per dataset, DLP_Configuration.xlsx (if ImportExcel is installed), Collection.log,
       and for the complete report 00_Assessment_Summary.csv/.html and DLP_Assessment_Report.docx
-      (a plain-English Word report explaining each area, the findings and Microsoft Learn links).
+      (a plain-English Word report explaining each area, the findings and Microsoft Learn links),
+      plus 80_Action_Plan (prioritised actions with effort and licence) and 81-84 (maturity scores,
+      hygiene checks, changes since the previous report, coverage map).
+
+    No Microsoft Graph: everything uses Security & Compliance PowerShell and, optionally, Exchange Online PowerShell.
 
 .PARAMETER Frameworks
     Frameworks referenced in the Word report: any of NCSC, NISTCSF, NIST80053, ISO27001 (or NIST, ISO, All, None).
@@ -44,11 +51,34 @@
     Sign in without the Windows Web Account Manager broker (passes -DisableWAM where the module supports it).
     Use if sign-in fails, for example with "You cannot call a method on a null-valued expression".
 
+.PARAMETER IncludeContentExplorer
+    Complete report: count stored items containing each sensitive information type (those used in rules plus common
+    built-in types) and each sensitivity label, per location, with Export-ContentExplorerData.
+    Needs the Content Explorer List Viewer role. ContentExplorerMaxTags limits the number of types queried (default 25).
+
+.PARAMETER IncludeDlpAudit
+    Complete report: read DLP rule matches, overrides and false positives from the unified audit log (Search-UnifiedAuditLog,
+    record types ComplianceDLPExchange, ComplianceDLPSharePoint, DLPEndpoint) for the last AuditDays days (default 30).
+    Signs in to Exchange Online; needs View-Only Audit Logs or Audit Logs. AuditMaxRecords caps records per type.
+
+.PARAMETER CustomerName
+    Name shown on the report cover ("Prepared for"). Default: the tenant organisation name.
+
+.PARAMETER AssessorName
+    Shown on the report cover as "Prepared by".
+
+.PARAMETER LogoPath
+    PNG or JPEG logo shown on the report cover.
+
+.PARAMETER CompareWith
+    A previous complete-report folder, or Latest for the newest earlier report for the same tenant. Adds
+    "Changes since the last assessment" and maturity changes to the report. In the menu you are asked when one exists.
+
 .PARAMETER Mode
     Menu (default) | InstallModules | TestAccess | Full | Area
 
 .PARAMETER Area
-    With -Mode Area: one or more area numbers (1-12) or names, e.g. -Area 2,3,8
+    With -Mode Area: one or more area numbers (1-14) or names, e.g. -Area 2,3,8
 
 .EXAMPLE
     .\Get-M365DlpConfiguration.ps1
@@ -57,6 +87,11 @@
 .EXAMPLE
     .\Get-M365DlpConfiguration.ps1 -Mode Full -UserPrincipalName admin@contoso.onmicrosoft.com -IncludeActivityExplorer
     Runs the complete report without the menu.
+
+.EXAMPLE
+    .\Get-M365DlpConfiguration.ps1 -Mode Full -IncludeExchange -IncludeContentExplorer -IncludeDlpAudit -CustomerName 'Fabrikam Ltd' -AssessorName 'Jane Smith' -LogoPath .\logo.png -CompareWith Latest
+    Complete report with evidence of where sensitive data is stored and how often rules fire, branded for the customer,
+    compared with the previous report for the same tenant.
 
 .EXAMPLE
     .\Get-M365DlpConfiguration.ps1 -Mode Area -Area 2,3,8 -UserPrincipalName admin@contoso.onmicrosoft.com
@@ -84,6 +119,15 @@ param(
     [switch]$DisableWAM,
     [switch]$NoWordReport,
     [string[]]$Frameworks = @('NCSC', 'NISTCSF', 'NIST80053', 'ISO27001'),
+    [switch]$IncludeContentExplorer,
+    [ValidateRange(1, 60)][int]$ContentExplorerMaxTags = 25,
+    [switch]$IncludeDlpAudit,
+    [ValidateRange(1, 90)][int]$AuditDays = 30,
+    [ValidateRange(100, 50000)][int]$AuditMaxRecords = 20000,
+    [string]$CustomerName,
+    [string]$AssessorName,
+    [string]$LogoPath,
+    [string]$CompareWith,
     [switch]$NoDisconnect
 )
 
@@ -101,6 +145,15 @@ $Script:Settings = [ordered]@{
     DisableWAM        = [bool]$DisableWAM
     WordReport        = -not [bool]$NoWordReport
     Frameworks        = $Frameworks
+    IncludeContentExplorer = [bool]$IncludeContentExplorer
+    ContentExplorerMaxTags = $ContentExplorerMaxTags
+    IncludeDlpAudit   = [bool]$IncludeDlpAudit
+    AuditDays         = $AuditDays
+    AuditMaxRecords   = $AuditMaxRecords
+    CustomerName      = $CustomerName
+    AssessorName      = $AssessorName
+    LogoPath          = $LogoPath
+    CompareWith       = $CompareWith
 }
 $Script:RequiredModules = @(
     [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; MinVersion = [version]'3.2.0'; Required = $true;  Purpose = 'Security & Compliance and Exchange Online cmdlets' }
@@ -119,6 +172,8 @@ $Script:Areas = [ordered]@{
     '10' = 'Operational ownership - role groups and members'
     '11' = 'Activity Explorer'
     '12' = 'Exchange Online mail flow rules and audit'
+    '13' = 'Content Explorer - where sensitive data is stored'
+    '14' = 'DLP rule activity from the audit log (matches, overrides)'
 }
 
 $Script:LogFile   = $null
@@ -126,6 +181,8 @@ $Script:OutputDir = $null
 $Script:Datasets  = [ordered]@{}
 $Script:Errors    = [System.Collections.Generic.List[object]]::new()
 $Script:Cache     = @{}
+$Script:AskCompare    = $false
+$Script:CompareFolder = ''
 $Script:ExcludeProps = @('PSComputerName', 'RunspaceId', 'PSShowComputerName', 'ObjectState', 'IsValid', 'OrganizationId', 'ExchangeVersion', 'ObjectClass')
 
 #endregion
@@ -302,6 +359,24 @@ function Find-RuleClassifiers {
     }
     $members = Get-Members $Node
     if (-not $members) { return }
+    # Current tenants return each SIT as a flat entry (name, id, mincount, confidencelevel...) rather than inside a 'sensitivetypes' group.
+    $flatName = Get-Val $Node 'name'
+    if ($flatName -and -not (Get-Val $Node 'sensitivetypes') -and -not (Get-Val $Node 'labels') -and ((Get-Val $Node 'mincount') -or (Get-Val $Node 'confidencelevel') -or (Get-Val $Node 'minconfidence') -or (Get-Val $Node 'classifiertype'))) {
+        $ct = [string](Get-Val $Node 'classifiertype')
+        [pscustomobject]@{
+            Policy = $Policy; Rule = $Rule; Source = $Source; Group = $GroupName
+            ReferenceType   = 'Classifier'
+            Name            = $flatName
+            Id              = Get-Val $Node 'id'
+            ClassifierType  = $(if (-not $ct -or $ct -eq 'Content') { 'Content (SIT)' } else { $ct })
+            ConfidenceLevel = Get-Val $Node 'confidencelevel'
+            MinConfidence   = Get-Val $Node 'minconfidence'
+            MaxConfidence   = Get-Val $Node 'maxconfidence'
+            MinCount        = Get-Val $Node 'mincount'
+            MaxCount        = Get-Val $Node 'maxcount'
+        }
+        return
+    }
     $thisGroup = Get-Val $Node 'name'
     if (-not $thisGroup) { $thisGroup = $GroupName }
     foreach ($m in $members) {
@@ -749,9 +824,13 @@ function Get-RuleClassifiers {
     Get-Cached 'RuleClassifiers' {
         foreach ($r in @(Get-Rules)) {
             $pol = [string](Get-Val $r 'ParentPolicyName')
-            Find-RuleClassifiers (Get-Val $r 'ContentContainsSensitiveInformation') $pol $r.Name 'Condition'
-            Find-RuleClassifiers (Get-Val $r 'ExceptIfContentContainsSensitiveInformation') $pol $r.Name 'Exception'
-            Find-RuleClassifiers (Get-Val $r 'AdvancedRule') $pol $r.Name 'AdvancedRule'
+            $found = @(
+                Find-RuleClassifiers (Get-Val $r 'ContentContainsSensitiveInformation') $pol $r.Name 'Condition'
+                Find-RuleClassifiers (Get-Val $r 'ExceptIfContentContainsSensitiveInformation') $pol $r.Name 'Exception'
+            )
+            # AdvancedRule repeats the same conditions as JSON; only use it when the rule has no simple SIT properties.
+            if ($found.Count -eq 0) { $found = @(Find-RuleClassifiers (Get-Val $r 'AdvancedRule') $pol $r.Name 'AdvancedRule') }
+            $found
         }
     }
 }
@@ -967,6 +1046,7 @@ function Export-AreaActivity {
 }
 
 function Export-AreaExchange {
+    param([switch]$WithDlpAudit)
     try { Connect-Exo }
     catch {
         Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'
@@ -984,13 +1064,209 @@ function Export-AreaExchange {
     $audit = Invoke-Step 'Unified audit log configuration' -Requires Get-AdminAuditLogConfig -Action { Get-AdminAuditLogConfig | Select-Object UnifiedAuditLogIngestionEnabled, AdminAuditLogEnabled }
     $Script:Cache['Audit'] = @($audit)
     Export-Dataset '71_Audit_Configuration' $audit
+    if ($WithDlpAudit) { Export-AreaDlpAudit -AlreadyConnected }
     Reset-AfterExo
+}
+
+# ---------- Content Explorer and audit-log evidence (Security & Compliance / Exchange Online PowerShell; no Graph) ----------
+
+# Common built-in types also counted by Content Explorer, so the report can show sensitive data that no DLP rule covers.
+# Only names that exist in the tenant are queried.
+$Script:CommonSits = @(
+    'Credit Card Number', 'International Banking Account Number (IBAN)', 'EU Debit Card Number', 'SWIFT Code',
+    'U.K. National Insurance Number (NINO)', 'U.K. National Health Service Number', 'U.S. / U.K. Passport Number',
+    'U.K. Unique Taxpayer Reference Number', 'U.S. Social Security Number (SSN)', 'U.S. Bank Account Number',
+    'General Password', 'Azure Storage Account Key', 'Azure SQL connection string'
+)
+$Script:CeWorkloads = [ordered]@{ Exchange = 'EXO'; SharePoint = 'SPO'; OneDrive = 'ODB'; Teams = 'Teams' }
+
+function Get-ContentExplorerCounts {
+    Get-Cached 'ContentExplorer' {
+        Invoke-Step 'Content Explorer item counts' -Requires Export-ContentExplorerData -Action {
+            $known = @{}; foreach ($s in @(Get-SITs)) { $known[[string]$s.Name] = $true }
+            $inRules = @(Get-RuleClassifiers | Where-Object { $_.ReferenceType -eq 'Classifier' -and $_.ClassifierType -eq 'Content (SIT)' } | ForEach-Object { [string]$_.Name } | Select-Object -Unique)
+            $names = @(@($inRules) + @($Script:CommonSits | Where-Object { $known.ContainsKey($_) }) | Select-Object -Unique | Select-Object -First $Script:Settings.ContentExplorerMaxTags)
+            $tags = @(foreach ($n in $names) { [pscustomobject]@{ TagType = 'SensitiveInformationType'; TagName = $n; UsedInDlpRules = ($inRules -contains $n) } })
+            foreach ($l in @(Get-LabelView)) {
+                $ln = if ($l.DisplayName) { [string]$l.DisplayName } else { [string]$l.Name }
+                $tags += [pscustomobject]@{ TagType = 'Sensitivity'; TagName = $ln; UsedInDlpRules = [bool]$l.UsedInDlpRules }
+            }
+            $ok = 0; $fail = 0; $i = 0
+            foreach ($t in $tags) {
+                $i++
+                Write-Progress -Activity 'Content Explorer' -Status $t.TagName -PercentComplete ([int](100 * $i / [Math]::Max(1, $tags.Count)))
+                foreach ($w in $Script:CeWorkloads.Keys) {
+                    $count = $null; $err = ''
+                    try {
+                        $res = @(Export-ContentExplorerData -TagType $t.TagType -TagName $t.TagName -Workload $Script:CeWorkloads[$w] -PageSize 1 -ErrorAction Stop)
+                        $hdr = $res | Where-Object { $_ -and $_.PSObject.Properties['TotalCount'] } | Select-Object -First 1
+                        if ($hdr) { $count = [int64]("0" + [string]$hdr.TotalCount) }
+                        $ok++
+                    }
+                    catch {
+                        $err = $_.Exception.Message.Split([Environment]::NewLine)[0]; $fail++
+                        if ($ok -eq 0 -and $fail -ge 4) { Write-Progress -Activity 'Content Explorer' -Completed; throw "Content Explorer queries failed ($err). The account needs the Content Explorer List Viewer role." }
+                    }
+                    [pscustomobject]@{ TagType = $t.TagType; TagName = $t.TagName; Workload = $w; ItemCount = $count; UsedInDlpRules = $t.UsedInDlpRules; Error = $err }
+                }
+            }
+            Write-Progress -Activity 'Content Explorer' -Completed
+        }
+    }
+}
+
+function Get-LocationKey {
+    <# Picks a readable location (site or mailbox) from a Content Explorer record, whatever the property is called. #>
+    param($Record)
+    foreach ($p in 'SiteUrl', 'Site', 'UserPrincipalName', 'Upn', 'Mailbox', 'Location', 'FileUrl', 'Url', 'Path', 'FilePath') {
+        $v = [string](Get-Val $Record $p)
+        if (-not $v) { continue }
+        $m = [regex]::Match($v, '^(https://[^/]+/(sites|teams|personal)/[^/?#]+)', 'IgnoreCase')
+        if ($m.Success) { return $m.Groups[1].Value }
+        return $v
+    }
+    return ''
+}
+
+function Get-ContentExplorerLocations {
+    <# For the most common sensitive information types, samples records to show where the data is concentrated. #>
+    Get-Cached 'ContentExplorerLocations' {
+        $counts = @(Get-ContentExplorerCounts | Where-Object { $_.TagType -eq 'SensitiveInformationType' -and $_.ItemCount -gt 0 -and $_.Workload -ne 'Teams' })
+        if ($counts.Count -eq 0) { return }
+        Invoke-Step 'Content Explorer top locations' -Requires Export-ContentExplorerData -Action {
+            foreach ($c in ($counts | Sort-Object ItemCount -Descending | Select-Object -First 8)) {
+                try {
+                    $res = @(Export-ContentExplorerData -TagType 'SensitiveInformationType' -TagName $c.TagName -Workload $Script:CeWorkloads[$c.Workload] -PageSize 500 -ErrorAction Stop)
+                    $recs = @($res | Where-Object { $_ -and -not $_.PSObject.Properties['TotalCount'] })
+                    $grp = @($recs | ForEach-Object { Get-LocationKey $_ } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 5)
+                    foreach ($g in $grp) {
+                        [pscustomobject]@{ TagName = $c.TagName; Workload = $c.Workload; Location = $g.Name; ItemsInSample = $g.Count; SampleSize = $recs.Count; TotalItems = $c.ItemCount }
+                    }
+                }
+                catch { Write-Log "  Top locations for $($c.TagName) ($($c.Workload)) not available: $($_.Exception.Message.Split([Environment]::NewLine)[0])" 'WARN' }
+            }
+        }
+    }
+}
+
+function ConvertTo-DlpAuditRows {
+    <# Turns one unified audit log record (DLP record types) into one row per matched policy rule. #>
+    param($Record, [string]$RecordType)
+    $d = $null
+    try { $d = [string]$Record.AuditData | ConvertFrom-Json } catch { return }
+    if (-not $d) { return }
+    $wl = [string](Get-Val $d 'Workload')
+    $workload = switch -Regex ($wl) {
+        'Teams' { 'Teams'; break } 'OneDrive' { 'OneDrive'; break } 'SharePoint' { 'SharePoint'; break } 'Exchange' { 'Exchange'; break } 'Endpoint' { 'Devices'; break }
+        default { switch ($RecordType) { 'ComplianceDLPExchange' { 'Exchange' } 'DLPEndpoint' { 'Devices' } default { 'SharePoint' } } }
+    }
+    $ex = Get-Val $d 'ExceptionInfo'
+    $reason = [string](Get-Val $ex 'Reason'); $just = [string](Get-Val $ex 'Justification')
+    $fp = [string](Get-Val $ex 'FalsePositive')
+    $common = @{
+        Date = [string](Get-Val $d 'CreationTime'); Operation = [string](Get-Val $d 'Operation'); Workload = $workload; User = [string](Get-Val $d 'UserId')
+        Override = [bool]($reason -match 'Override' -or $just); FalsePositive = [bool]($fp -eq 'True' -or $reason -match 'FalsePositive'); Justification = $just
+    }
+    $emitted = $false
+    foreach ($pd in @(Get-Val $d 'PolicyDetails')) {
+        if ($null -eq $pd) { continue }
+        foreach ($r in @(Get-Val $pd 'Rules')) {
+            if ($null -eq $r) { continue }
+            $cm = Get-Val $r 'ConditionsMatched'
+            $sits = @(foreach ($si in @(Get-Val $cm 'SensitiveInformation')) { [string](Get-Val $si 'SensitiveInformationTypeName') }) | Where-Object { $_ } | Select-Object -Unique
+            $row = [ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
+                Policy = [string](Get-Val $pd 'PolicyName'); Rule = [string](Get-Val $r 'RuleName'); Severity = [string](Get-Val $r 'Severity')
+                Actions = (@(Get-Val $r 'Actions') -join ', '); SensitiveTypes = (@($sits) -join ', ')
+                Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+            [pscustomobject]$row; $emitted = $true
+        }
+    }
+    foreach ($pm in @(Get-Val $d 'PolicyMatchInfo')) {
+        if ($null -eq $pm) { continue }
+        [pscustomobject][ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
+            Policy = [string](Get-Val $pm 'PolicyName'); Rule = [string](Get-Val $pm 'RuleName'); Severity = [string](Get-Val $d 'Severity')
+            Actions = [string](Get-Val $d 'EnforcementMode'); SensitiveTypes = ''
+            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+        $emitted = $true
+    }
+    if (-not $emitted -and $common.Operation) {
+        [pscustomobject][ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
+            Policy = ''; Rule = ''; Severity = ''; Actions = ''; SensitiveTypes = ''
+            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+    }
+}
+
+function Get-DlpAuditRecords {
+    Get-Cached 'DlpAudit' {
+        $days = $Script:Settings.AuditDays
+        Invoke-Step "DLP rule activity from the audit log ($days days)" -Requires Search-UnifiedAuditLog -Action {
+            $end = (Get-Date).ToUniversalTime(); $start = $end.AddDays(-$days)
+            foreach ($rt in 'ComplianceDLPExchange', 'ComplianceDLPSharePoint', 'DLPEndpoint') {
+                $sid = [guid]::NewGuid().ToString(); $n = 0
+                try {
+                    while ($true) {
+                        $page = @(Search-UnifiedAuditLog -StartDate $start -EndDate $end -RecordType $rt -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000 -ErrorAction Stop)
+                        if ($page.Count -eq 0) { break }
+                        foreach ($p in $page) { ConvertTo-DlpAuditRows -Record $p -RecordType $rt }
+                        $n += $page.Count
+                        $last = $page[-1]
+                        $idx = [int]("0" + [string](Get-Val $last 'ResultIndex')); $total = [int]("0" + [string](Get-Val $last 'ResultCount'))
+                        if ($n -ge $Script:Settings.AuditMaxRecords -or ($total -gt 0 -and $idx -ge $total) -or $page.Count -lt 5000) { break }
+                    }
+                    Write-Log "  $($rt): $n audit record(s)"
+                    if ($n -ge $Script:Settings.AuditMaxRecords) { Write-Log "  $rt record cap ($($Script:Settings.AuditMaxRecords)) reached; counts are partial." 'WARN' }
+                }
+                catch { Write-Log "  $rt search failed: $($_.Exception.Message.Split([Environment]::NewLine)[0])" 'WARN' }
+            }
+        }
+    }
+}
+
+function Get-DlpRuleActivity {
+    <# Summarises audit rows per policy rule: matches, overrides, false positives, distinct users. #>
+    Get-Cached 'DlpRuleActivity' {
+        $rows = @(Get-DlpAuditRecords | Where-Object { $_.Policy })
+        foreach ($g in ($rows | Group-Object { "$($_.Policy)|$($_.Rule)" })) {
+            $pr = $g.Name -split '\|', 2
+            $hits = @($g.Group | Where-Object { $_.Operation -notmatch 'Undo|DlpInfo' })
+            $last = ''
+            try { $last = (@($g.Group | ForEach-Object { [datetime]$_.Date }) | Sort-Object -Descending | Select-Object -First 1).ToString('dd MMM yyyy') } catch { }
+            [pscustomobject][ordered]@{
+                Policy = $pr[0]; Rule = $pr[1]; Matches = $hits.Count
+                Overrides = @($g.Group | Where-Object Override).Count; FalsePositives = @($g.Group | Where-Object FalsePositive).Count
+                Undone = @($g.Group | Where-Object { $_.Operation -match 'Undo' }).Count
+                DistinctUsers = @($g.Group | Select-Object -ExpandProperty User -Unique | Where-Object { $_ }).Count
+                Workloads = (@($g.Group | Select-Object -ExpandProperty Workload -Unique) -join ', '); LastMatch = $last
+            }
+        }
+    }
+}
+
+function Export-AreaContentExplorer {
+    Export-Dataset '62_Content_Explorer_Counts' @(Get-ContentExplorerCounts) -AlreadyFlat
+    Export-Dataset '63_Content_Explorer_Top_Locations' @(Get-ContentExplorerLocations) -AlreadyFlat
+}
+
+function Export-AreaDlpAudit {
+    param([switch]$AlreadyConnected)
+    if (-not $AlreadyConnected) {
+        try { Connect-Exo }
+        catch {
+            Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'
+            $Script:Errors.Add([pscustomobject]@{ Step = "DLP rule activity from the audit log ($($Script:Settings.AuditDays) days)"; Outcome = 'Failed'; Error = $_.Exception.Message })
+            return
+        }
+    }
+    Export-Dataset '64_DLP_Audit_Rule_Matches' @(Get-DlpAuditRecords) -AlreadyFlat
+    Export-Dataset '65_DLP_Rule_Activity_Summary' @(Get-DlpRuleActivity) -AlreadyFlat
+    if (-not $AlreadyConnected) { Reset-AfterExo }
 }
 
 $Script:AreaFunctions = @{
     '1' = 'Export-AreaTenant'; '2' = 'Export-AreaPolicies'; '3' = 'Export-AreaRules'; '4' = 'Export-AreaClassifiers'
     '5' = 'Export-AreaSITs'; '6' = 'Export-AreaEDM'; '7' = 'Export-AreaLabels'; '8' = 'Export-AreaEndpoint'
     '9' = 'Export-AreaAlerts'; '10' = 'Export-AreaOwnership'; '11' = 'Export-AreaActivity'; '12' = 'Export-AreaExchange'
+    '13' = 'Export-AreaContentExplorer'; '14' = 'Export-AreaDlpAudit'
 }
 
 #endregion
@@ -1024,6 +1300,9 @@ $Script:LearnLinks = @{
     ActivityExplorer = @{ Title = 'Get started with Activity explorer'; Url = 'https://learn.microsoft.com/en-us/purview/data-classification-activity-explorer' }
     Permissions      = @{ Title = 'Permissions in the Microsoft Purview portal'; Url = 'https://learn.microsoft.com/en-us/purview/purview-permissions' }
     MailFlow         = @{ Title = 'Mail flow rules (transport rules) in Exchange Online'; Url = 'https://learn.microsoft.com/en-us/exchange/security-and-compliance/mail-flow-rules/mail-flow-rules' }
+    ContentExplorer  = @{ Title = 'Learn about content explorer'; Url = 'https://learn.microsoft.com/en-us/purview/data-classification-content-explorer' }
+    AuditSearch      = @{ Title = 'Search the audit log'; Url = 'https://learn.microsoft.com/en-us/purview/audit-search' }
+    Licensing        = @{ Title = 'Microsoft 365 guidance for security & compliance (licensing)'; Url = 'https://learn.microsoft.com/en-us/office365/servicedescriptions/microsoft-365-service-descriptions/microsoft-365-tenantlevel-services-licensing-guidance/microsoft-365-security-compliance-licensing-guidance' }
 }
 
 $Script:DocWidth = 9864   # A4 portrait content width in twips (1.8 cm margins)
@@ -1033,6 +1312,7 @@ function New-WordDoc {
         Body  = [System.Text.StringBuilder]::new()
         Rels  = [System.Collections.Generic.List[string]]::new()
         RelId = 100
+        Media = [System.Collections.Generic.List[object]]::new()
     }
     $Script:ReportObs = [System.Collections.Generic.List[object]]::new()
 }
@@ -1241,7 +1521,7 @@ function Save-WordDoc {
     $R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
     $bullet = [string][char]0x2022
 
-    $contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>'
+    $contentTypes = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/><Override PartName="/word/settings.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>'
     $rootRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>'
     $docRels = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/><Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/>' + ($Script:Doc.Rels -join '') + '</Relationships>'
     $font = '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Calibri" w:cs="Calibri"/>'
@@ -1264,7 +1544,7 @@ function Save-WordDoc {
     $now = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     $core = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>' + (ConvertTo-XmlText $Title) + '</dc:title><dc:creator>' + (ConvertTo-XmlText $Author) + '</dc:creator><dcterms:created xsi:type="dcterms:W3CDTF">' + $now + '</dcterms:created><dcterms:modified xsi:type="dcterms:W3CDTF">' + $now + '</dcterms:modified></cp:coreProperties>'
     $sect = '<w:sectPr><w:footerReference w:type="default" r:id="rId4"/><w:pgSz w:w="11906" w:h="16838"/><w:pgMar w:top="1134" w:right="1021" w:bottom="1134" w:left="1021" w:header="567" w:footer="567" w:gutter="0"/><w:titlePg/></w:sectPr>'
-    $document = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="' + $W + '" xmlns:r="' + $R + '"><w:body>' + $Script:Doc.Body.ToString() + $sect + '</w:body></w:document>'
+    $document = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="' + $W + '" xmlns:r="' + $R + '" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><w:body>' + $Script:Doc.Body.ToString() + $sect + '</w:body></w:document>'
 
     $parts = [ordered]@{
         '[Content_Types].xml'          = $contentTypes
@@ -1287,6 +1567,10 @@ function Save-WordDoc {
                 $entry = $zip.CreateEntry($name)
                 $sw = New-Object System.IO.StreamWriter($entry.Open(), $enc)
                 try { $sw.Write($parts[$name]) } finally { $sw.Dispose() }
+            }
+            foreach ($m in @($Script:Doc.Media)) {
+                $es = $zip.CreateEntry("word/media/$($m.Name)").Open()
+                try { $es.Write($m.Bytes, 0, $m.Bytes.Length) } finally { $es.Dispose() }
             }
         }
         finally { $zip.Dispose() }
@@ -1765,6 +2049,753 @@ function Add-FrameworkAppendix {
     )
 }
 
+# ---------- Readable configuration detail (plain-English descriptions of collected settings) ----------
+
+function ConvertFrom-CamelCase {
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    $t = $Text -creplace '([a-z0-9])([A-Z])', '$1 $2' -creplace '([A-Z]+)([A-Z][a-z])', '$1 $2'
+    return ($t.Substring(0, 1).ToUpper() + $t.Substring(1).ToLower()) -replace '\bdlp\b', 'DLP' -replace '\bid\b', 'ID' -replace '\bip\b', 'IP' -replace '\burl\b', 'URL'
+}
+
+function Get-ItemText {
+    <# Turns a location / recipient / group value into readable text. #>
+    param($Value)
+    $out = foreach ($v in @($Value)) {
+        if ($null -eq $v) { continue }
+        if ($v -is [string] -or $v -is [ValueType]) { [string]$v; continue }
+        $n = Get-Val $v 'DisplayName'; if (-not $n) { $n = Get-Val $v 'Name' }; if (-not $n) { $n = [string]$v }
+        $n
+    }
+    $list = @($out | Where-Object { $_ -and $_ -ne '{}' })
+    if ($list.Count -eq 0) { return '' }
+    if ($list.Count -gt 15) { return (($list | Select-Object -First 15) -join ', ') + " and $($list.Count - 15) more" }
+    return ($list -join ', ')
+}
+
+$Script:LocationNames = [ordered]@{
+    ExchangeLocation = 'Exchange email'; SharePointLocation = 'SharePoint sites'; OneDriveLocation = 'OneDrive accounts'; TeamsLocation = 'Teams chat and channel messages'
+    EndpointDlpLocation = 'Devices'; OnPremisesScannerDlpLocation = 'On-premises repositories'; ThirdPartyAppDlpLocation = 'Non-Microsoft cloud apps'; PowerBIDlpLocation = 'Power BI workspaces'
+    ExchangeSenderMemberOf = 'Exchange: senders in groups'; OneDriveSharedByMemberOf = 'OneDrive: accounts of group members'; TeamsLocationException = 'Teams: excluded'
+    ModernGroupLocation = 'Microsoft 365 groups'
+}
+
+function Get-PolicyLocationRows {
+    param($Policy, [string]$Workload)
+    $inc = @(); $exc = @()
+    foreach ($p in $Policy.PSObject.Properties) {
+        if ($p.Name -notmatch '(Location|MemberOf|SharedBy)(Exception)?$' -or $p.Name -match '^Locations$') { continue }
+        $txt = Get-ItemText $p.Value
+        if (-not $txt) { continue }
+        $base = $p.Name -replace 'Exception$', ''
+        $label = if ($Script:LocationNames.Contains($base)) { $Script:LocationNames[$base] } else { ConvertFrom-CamelCase $base }
+        if ($p.Name -match 'Exception$') { $exc += "$label - $txt" } else { $inc += $(if ($txt -eq 'All') { "$label (all)" } else { "$label - $txt" }) }
+    }
+    if ($Workload -match 'Applications|Copilot') { $inc += 'Microsoft 365 Copilot and Copilot Chat' }
+    return @{ Included = $inc; Excluded = $exc }
+}
+
+$Script:EndpointActionNames = @{
+    RemovableMedia = 'Copy to removable USB storage'; Print = 'Print'; CloudEgress = 'Upload to cloud service domains'; CopyPaste = 'Copy to clipboard'
+    NetworkShare = 'Copy to a network share'; UnallowedApps = 'Access by restricted apps'; UnallowedBluetoothApp = 'Transfer over Bluetooth'
+    UnallowedBrowser = 'Access by unallowed browsers'; RemoteDesktopServices = 'Copy over Remote Desktop'; RdpCopyPaste = 'Copy over Remote Desktop'
+    PasteToBrowser = 'Paste to browser'; CopyToRemovableMedia = 'Copy to removable USB storage'
+}
+
+function Get-ClassifierText {
+    param($Row, [hashtable]$LabelNames)
+    if ($Row.ReferenceType -eq 'SensitivityLabel') {
+        $n = [string]$Row.Name; if ($LabelNames.ContainsKey($n)) { $n = $LabelNames[$n] } elseif ($Row.Id -and $LabelNames.ContainsKey([string]$Row.Id)) { $n = $LabelNames[[string]$Row.Id] }
+        return "content labelled **$n**"
+    }
+    $bits = @()
+    if ($Row.ClassifierType -match 'MLModel|Trainable') { $bits += 'trainable classifier' }
+    elseif ($Row.ClassifierType -match 'ExactMatch|EDM') { $bits += 'Exact Data Match' }
+    if ($Row.ConfidenceLevel) { $bits += "$(([string]$Row.ConfidenceLevel).ToLower()) confidence" }
+    elseif ($Row.MinConfidence) { $bits += "confidence $($Row.MinConfidence)%+" }
+    $min = [string]$Row.MinCount; $max = [string]$Row.MaxCount
+    if ($min -and $min -ne '1') { $bits += $(if ($max -and $max -ne '-1') { "$min to $max instances" } else { "$min or more" }) }
+    elseif ($min -eq '1' -and $max -and $max -ne '-1') { $bits += "up to $max instances" }
+    $t = "**$($Row.Name)**"
+    if ($bits.Count) { $t += " ($($bits -join ', '))" }
+    return $t
+}
+
+$Script:RuleMetaProps = '^(Name|Policy|ParentPolicyName|Guid|Identity|Id|ImmutableId|Priority|Mode|Disabled|Comment|Workload|Created.*|LastModified.*|When.*|DistributionStatus|ReadOnly|IsValid|ObjectVersion|ExchangeVersion|ObjectState|OrganizationId|RunspaceId|PSComputerName|PSShowComputerName|ContentContainsSensitiveInformation|ExceptIfContentContainsSensitiveInformation|AdvancedRule|RuleErrorAction|ReportSeverityLevel)$'
+$Script:RuleCondProps = '^(ContentContains|ExceptIf|Sent|From|Recipient|Document|Content|Subject|Message|Access|Has|Header|Anyof|Processing|With|Unscannable|Evaluate|Sender)'
+
+function Get-RuleDescription {
+    <# Returns @{ When = string[]; Except = string[]; Then = string[] } describing a DLP rule in plain English. #>
+    param($Rule, [object[]]$ClassRows, [hashtable]$LabelNames)
+    $when = @(); $except = @(); $then = @()
+    $cond = @($ClassRows | Where-Object { $_.Source -ne 'Exception' })
+    $exc = @($ClassRows | Where-Object { $_.Source -eq 'Exception' })
+    if ($cond.Count) { $when += 'Content contains any of: ' + ((@($cond | ForEach-Object { Get-ClassifierText $_ $LabelNames } | Select-Object -Unique)) -join '; ') }
+    if ($exc.Count) { $except += 'Content contains any of: ' + ((@($exc | ForEach-Object { Get-ClassifierText $_ $LabelNames } | Select-Object -Unique)) -join '; ') }
+    foreach ($p in $Rule.PSObject.Properties) {
+        if ($p.Name -match $Script:RuleMetaProps -or $p.Name -notmatch $Script:RuleCondProps -or ($Script:RuleActionProps -contains $p.Name -and $p.Name -ne 'AccessScope')) { continue }
+        $v = ConvertTo-CellValue $p.Value
+        if (-not $v -or $v -eq 'False' -or $v -eq '0' -or $v -eq '{}' -or $v -eq '[]') { continue }
+        if ($p.Name -eq 'AccessScope') {
+            $when += $(switch ($v) { 'NotInOrganization' { 'Content is shared with people **outside the organisation**' } 'InOrganization' { 'Content is shared **inside the organisation**' } default { "Access scope: $v" } })
+            continue
+        }
+        $isExc = $p.Name -like 'ExceptIf*'
+        $label = ConvertFrom-CamelCase ($p.Name -replace '^ExceptIf', '')
+        $text = if ($v -eq 'True') { $label } else { "$($label): $(($v -replace ' \| ', ', '))" }
+        if ($text.Length -gt 300) { $text = $text.Substring(0, 300) + ' ...' }
+        if ($isExc) { $except += $text } else { $when += $text }
+    }
+    if ($when.Count -eq 0) { $when += 'Any content in the locations the policy covers' }
+
+    $block = ConvertTo-CellValue (Get-Val $Rule 'BlockAccess')
+    if ($block -eq 'True') {
+        $scope = [string](Get-Val $Rule 'BlockAccessScope')
+        $then += $(switch ($scope) { 'PerUser' { '**Block** access for people outside the organisation' } 'PerAnonymousUser' { '**Block** access through "anyone" links' } default { '**Block** the action (or access for everyone except the owner)' } })
+    }
+    $ovr = ConvertTo-CellValue (Get-Val $Rule 'NotifyAllowOverride')
+    if ($ovr) {
+        $ovText = @(($ovr -split ' \| ') | ForEach-Object { switch ($_) { 'WithJustification' { 'with a business justification' } 'WithoutJustification' { 'without a justification' } 'FalsePositive' { 'by reporting a false positive' } 'WithAcknowledgement' { 'after acknowledging a warning' } default { $_ } } })
+        $then += "Users can **override** $($ovText -join ' or ')"
+    }
+    $notify = ConvertTo-CellValue (Get-Val $Rule 'NotifyUser')
+    if ($notify) {
+        $then += "**Notify** $(Get-PersonText ($notify -split ' \| ')) with a policy tip and/or email"
+    }
+    $tip = [string](Get-Val $Rule 'NotifyPolicyTipCustomText')
+    if ($tip) { $then += "Policy tip text: ""$tip""" }
+    foreach ($er in @(Get-Val $Rule 'EndpointDlpRestrictions')) {
+        if ($null -eq $er) { continue }
+        $set = [string](Get-Val $er 'Setting'); $val = [string](Get-Val $er 'Value')
+        if (-not $set) { continue }
+        $nm = if ($Script:EndpointActionNames.ContainsKey($set)) { $Script:EndpointActionNames[$set] } else { ConvertFrom-CamelCase $set }
+        $act = switch ($val) { 'Block' { 'block' } 'Warn' { 'warn (user can override)' } 'Audit' { 'audit only' } default { $val.ToLower() } }
+        $then += "Devices - $($nm): **$act**"
+    }
+    $enc = [string](Get-Val $Rule 'EncryptRMSTemplate'); if ($enc) { $then += "Encrypt the message with template ""$enc""" }
+    if (ConvertTo-CellValue (Get-Val $Rule 'Quarantine')) { $then += 'Quarantine the message' }
+    $redir = Get-ItemText (Get-Val $Rule 'RedirectMessageTo'); if ($redir) { $then += "Redirect the message to $redir" }
+    $subj = [string](Get-Val $Rule 'ModifySubject'); if ($subj) { $then += 'Modify the message subject' }
+    $alert = ConvertTo-CellValue (Get-Val $Rule 'GenerateAlert')
+    if ($alert) {
+        $alertTo = @(($alert -split ' \| ') | Where-Object { $_ -and $_ -notmatch '^(true|false)$' })
+        $then += $(if ($alertTo.Count) { "Raise an **alert** and email $(Get-PersonText $alertTo)" } else { 'Raise an **alert** (see section 16 for who is notified)' })
+    }
+    $inc = ConvertTo-CellValue (Get-Val $Rule 'GenerateIncidentReport'); if ($inc) { $then += "Email an incident report to $(Get-PersonText ($inc -split ' \| '))" }
+    if ((ConvertTo-CellValue (Get-Val $Rule 'StopPolicyProcessing')) -eq 'True') { $then += 'Stop processing further rules' }
+    if (-not ($then | Where-Object { $_ -notmatch '^(Raise an|Email an incident|Policy tip text|Stop processing)' })) { $then = @('**Audit only**: record the event (users are not told and the action is allowed)') + $then }
+    return @{ When = $when; Except = $except; Then = $then }
+}
+
+function Add-PolicyDetailAppendix {
+    param([object[]]$Policies, [object[]]$Rules, [object[]]$ClassRows, [hashtable]$LabelNames)
+    Add-DocHeading 'Appendix E: DLP policies and rules in detail' 1
+    Add-DocPara 'This appendix describes every DLP policy and rule collected from the tenant in plain English, so the configuration can be reviewed without opening the spreadsheets. Policies are listed in priority order; rules are listed in the order they are evaluated. Where a rule groups conditions with AND / OR logic, the exact logic is in 14_DLP_Rules_Conditions_Actions.'
+    if ($Policies.Count -eq 0) { Add-DocPara 'No DLP policies were found.'; return }
+    $modeText = @{ 'Enable' = 'Enforced (actions are applied)'; 'TestWithNotifications' = 'Simulation, with policy tips shown to users'; 'TestWithoutNotifications' = 'Simulation, silent (nothing shown to users)'; 'Disable' = 'Disabled'; 'PendingDeletion' = 'Being deleted' }
+    foreach ($p in ($Policies | Sort-Object { [int]('0' + (Get-Val $_ 'Priority')) })) {
+        Add-DocHeading ([string]$p.Name) 2
+        $loc = Get-PolicyLocationRows -Policy $p -Workload (ConvertTo-CellValue (Get-Val $p 'Workload'))
+        $pRules = @($Rules | Where-Object { [string](Get-Val $_ 'ParentPolicyName') -eq [string]$p.Name } | Sort-Object { [int]('0' + (Get-Val $_ 'Priority')) })
+        $changed = ''
+        try { if (Get-Val $p 'WhenChangedUTC') { $changed = ([datetime](Get-Val $p 'WhenChangedUTC')).ToString('dd MMM yyyy') } } catch { }
+        $by = [string](Get-Val $p 'LastModifiedBy')
+        $mode = [string]$p.Mode
+        $card = @(
+            , @('Mode', $(if ($modeText.ContainsKey($mode)) { $modeText[$mode] } else { $mode }))
+            , @('Applies to', $(if ($loc.Included.Count) { $loc.Included -join '; ' } else { 'No locations found' }))
+        )
+        if ($loc.Excluded.Count) { $card += , @('Excludes', ($loc.Excluded -join '; ')) }
+        $desc = [string](Get-Val $p 'Comment'); if ($desc) { $card += , @('Description', $desc) }
+        $card += , @('Rules', [string]$pRules.Count)
+        $card += , @('Priority', [string](Get-Val $p 'Priority'))
+        if ($changed -or $by) { $card += , @('Last changed', ((@($changed, $(if ($by) { "by $by" })) | Where-Object { $_ }) -join ' ')) }
+        Add-DocTable -Headers @('Policy setting', 'Value') -Widths @(1.6, 6) -FontSize 17 -Rows $card
+        if ($pRules.Count -eq 0) { Add-DocPara 'This policy has no rules.' -Italic; continue }
+        $n = 1
+        foreach ($r in $pRules) {
+            $state = if ((ConvertTo-CellValue (Get-Val $r 'Disabled')) -eq 'True') { 'Disabled' } else { 'Active' }
+            $sev = [string](Get-Val $r 'ReportSeverityLevel')
+            $meta = @($state, $(if ($sev -and $sev -ne 'None') { "severity $($sev.ToLower())" })) | Where-Object { $_ }
+            Add-DocPara "**Rule $($n): $($r.Name)**  ($($meta -join ', '))" -Size 21 -Color '1F3B57' -After 40 -Before 120
+            $d = Get-RuleDescription -Rule $r -ClassRows @($ClassRows | Where-Object { $_.Policy -eq [string]$p.Name -and $_.Rule -eq [string]$r.Name }) -LabelNames $LabelNames
+            Add-DocBullet ('**When:** ' + ($d.When -join '; **and** '))
+            if ($d.Except.Count) { Add-DocBullet ('**Except when:** ' + ($d.Except -join '; **or** ')) }
+            Add-DocBullet ('**Then:** ' + ($d.Then -join '; '))
+            $n++
+        }
+    }
+}
+
+$Script:EndpointSettingNames = @{
+    CloudAppMode = 'Service domain mode (allow or block list)'; CloudAppRestrictions = 'Service domains'; UnallowedBrowser = 'Unallowed browsers'
+    UnallowedApp = 'Restricted apps'; UnallowedCloudSyncApp = 'Unallowed cloud sync apps'; UnallowedBluetoothApp = 'Unallowed Bluetooth apps'
+    PathExclusion = 'Excluded file paths (Windows)'; MacPathExclusion = 'Excluded file paths (macOS)'; AdvancedClassificationEnabled = 'Advanced classification scanning'
+    BandwidthLimitEnabled = 'Bandwidth limit for advanced classification'; DailyBandwidthLimitInMB = 'Daily bandwidth limit (MB)'; EvidenceStoreSettings = 'Evidence collection for file activities'
+    IncludePredefinedUnallowedBluetoothApps = 'Include predefined unallowed Bluetooth apps'; AlwaysAuditEndpointActivity = 'Always audit device activity'
+    VPNSettings = 'VPN settings'; NetworkPrinter = 'Network printers'; BusinessJustificationList = 'Override justification options'
+    DefaultPathExclusionsEnabled = 'Default file path exclusions in use'
+}
+$Script:EndpointAreaNames = @{
+    EndpointDlpGlobalSettings = 'Global settings'; EndpointDlpBrowserRestrictions = 'Browser restrictions'; DlpPrinterGroups = 'Printer groups'
+    DlpRemovableMediaGroups = 'Removable storage groups'; DlpNetworkShareGroups = 'Network share groups'; DlpAppGroups = 'App groups'
+    DlpExtensionGroups = 'File extension groups'; ExtendTeamsDlpToSpoOdbConsent = 'Teams DLP extended to SharePoint and OneDrive files'
+}
+
+function Get-EndpointSettingRows {
+    param([object[]]$Settings)
+    foreach ($s in $Settings) {
+        if (-not $s.Value -or ([string]$s.Value).Trim() -in '{}', '[]') { continue }
+        $areaKey = ([string]$s.Area) -replace 'Psws$', ''
+        $area = if ($Script:EndpointAreaNames.ContainsKey($areaKey)) { $Script:EndpointAreaNames[$areaKey] } else { ConvertFrom-CamelCase $areaKey }
+        $name = [string]$s.Setting; $val = [string]$s.Value
+        if (-not $name -and $val.Trim().StartsWith('{')) {
+            try {
+                $o = $val | ConvertFrom-Json
+                $g = Get-Val $o 'groupName'; if (-not $g) { $g = Get-Val $o 'name' }
+                $name = if ($g) { [string]$g } else { 'Group' }
+                $parts = foreach ($pp in $o.PSObject.Properties) { if ($pp.Name -notmatch '^(groupName|name)$') { "$(ConvertFrom-CamelCase $pp.Name): $(ConvertTo-CellValue $pp.Value)" } }
+                $val = (@($parts) -join '; ')
+            }
+            catch { }
+        }
+        elseif ($Script:EndpointSettingNames.ContainsKey($name)) { $name = $Script:EndpointSettingNames[$name] }
+        elseif ($name) { $name = ConvertFrom-CamelCase $name }
+        if ($val.Length -gt 400) { $val = $val.Substring(0, 400) + ' ...' }
+        , @($area, $name, ($val -replace ' \| ', ', '))
+    }
+}
+
+function Get-LabelPolicyRows {
+    param([object[]]$LabelPolicies, [hashtable]$LabelNames)
+    foreach ($lp in $LabelPolicies) {
+        $labs = @(foreach ($l in @(Get-Val $lp 'Labels')) { $k = [string](Get-ItemText $l); if ($LabelNames.ContainsKey($k)) { $LabelNames[$k] } else { $k } }) | Where-Object { $_ }
+        $scope = @(foreach ($p in $lp.PSObject.Properties) {
+                if ($p.Name -notmatch 'Location$') { continue }
+                $t = Get-ItemText $p.Value
+                if ($t) {
+                    $where = switch ($p.Name -replace 'Location$', '') { 'Exchange' { 'Users and groups' } 'ModernGroup' { 'Microsoft 365 groups' } default { ConvertFrom-CamelCase $_ } }
+                    "$($where): $(if ($t -eq 'All') { 'all' } else { $t })"
+                }
+            })
+        $settings = @(foreach ($s in @(Get-Val $lp 'Settings')) {
+                $m = [regex]::Match([string]$s, '^\[\s*([^,]+?)\s*,\s*(.*?)\s*\]$')
+                if (-not $m.Success) { continue }
+                $k = $m.Groups[1].Value.ToLower(); $v = $m.Groups[2].Value
+                switch ($k) {
+                    'mandatory' { if ($v -eq 'true') { 'Labelling is mandatory' } }
+                    'requiredowngradejustification' { if ($v -eq 'true') { 'Justification required to remove or lower a label' } }
+                    'defaultlabelid' { "Default label: $(if ($LabelNames.ContainsKey($v)) { $LabelNames[$v] } else { $v })" }
+                    'outlookdefaultlabel' { if ($v -and $v -ne 'None') { "Default email label: $(if ($LabelNames.ContainsKey($v)) { $LabelNames[$v] } else { $v })" } }
+                    'disablemandatoryinoutlook' { if ($v -eq 'true') { 'Mandatory labelling not applied in Outlook' } }
+                    'powerbimandatory' { if ($v -eq 'true') { 'Mandatory labelling for Power BI' } }
+                    'siteandgroupmandatory' { if ($v -eq 'true') { 'Label required for sites and groups' } }
+                    'teamworkmandatory' { if ($v -eq 'true') { 'Label required for Teams meetings' } }
+                    'siteandgroupdefaultlabelid' { if ($v -and $v -ne 'None') { "Default site and group label: $(if ($LabelNames.ContainsKey($v)) { $LabelNames[$v] } else { $v })" } }
+                }
+            })
+        , @([string]$lp.Name, (@($labs) -join ', '), $(if ($scope.Count) { $scope -join '; ' } else { 'All users' }), $(if ($settings.Count) { $settings -join '; ' } else { 'Default settings' }))
+    }
+}
+
+function Get-PersonText {
+    <# Turns recipient keywords (Owner, SiteAdmin, TenantAdmins...) into plain English. #>
+    param([string[]]$Values)
+    $list = @(foreach ($v in $Values) {
+            if (-not $v) { continue }
+            switch ($v) { 'Owner' { 'the content owner' } 'LastModifier' { 'the person who last modified it' } 'SiteAdmin' { 'the site admin' } 'TenantAdmins' { 'tenant admins' } default { $v } }
+        })
+    if ($list.Count -le 1) { return ($list -join '') }
+    return (($list[0..($list.Count - 2)] -join ', ') + ' and ' + $list[-1])
+}
+
+function Get-AutoLabelRows {
+    param([object[]]$AutoPolicies, [object[]]$AutoRules, [hashtable]$LabelNames)
+    $modeText = @{ 'Enable' = 'Applying labels'; 'TestWithNotifications' = 'Simulation (with notifications)'; 'TestWithoutNotifications' = 'Simulation'; 'Disable' = 'Off' }
+    foreach ($ap in $AutoPolicies) {
+        $lab = [string](Get-ItemText (Get-Val $ap 'ApplySensitivityLabel')); if ($LabelNames.ContainsKey($lab)) { $lab = $LabelNames[$lab] }
+        $mode = [string]$ap.Mode; if ($modeText.ContainsKey($mode)) { $mode = $modeText[$mode] }
+        $loc = Get-PolicyLocationRows -Policy $ap -Workload ''
+        $rows = @($AutoRules | Where-Object { [string](Get-Val $_ 'ParentPolicyName') -eq [string]$ap.Name })
+        $sits = @(foreach ($r in $rows) { Find-RuleClassifiers (Get-Val $r 'ContentContainsSensitiveInformation') ([string]$ap.Name) ([string]$r.Name) 'Condition' }) |
+            ForEach-Object { if ($_.ReferenceType -eq 'SensitivityLabel') { "label $($_.Name)" } else { [string]$_.Name } } | Where-Object { $_ } | Select-Object -Unique
+        , @([string]$ap.Name, $lab, $mode, $(if ($loc.Included.Count) { $loc.Included -join '; ' } else { '' }), $(if (@($sits).Count) { @($sits) -join ', ' } else { "$($rows.Count) rule(s); see 33_Auto_Labelling_Rules" }))
+    }
+}
+
+function Get-DictionaryRows {
+    param([object[]]$Dictionaries)
+    foreach ($d in $Dictionaries) {
+        $kw = [string](Get-Val $d 'KeywordDictionary')
+        $count = if ($kw) { @($kw -split '[,\r\n]+' | Where-Object { $_.Trim() }).Count } else { 0 }
+        , @([string]$d.Name, [string](Get-Val $d 'Description'), $(if ($count) { [string]$count } else { 'Not shown' }))
+    }
+}
+
+function Get-EdmSchemaRows {
+    param([object[]]$Schemas)
+    foreach ($s in $Schemas) {
+        $xmlText = [string](Get-Val $s 'EdmSchemaXML'); if (-not $xmlText) { $xmlText = [string](Get-Val $s 'SchemaXml') }
+        $fields = @([regex]::Matches($xmlText, '<Field\b[^>]*?name="([^"]+)"[^>]*?>') | ForEach-Object {
+                $n = $_.Groups[1].Value; if ($_.Value -match 'searchable="true"') { "**$n** (searchable)" } else { $n } })
+        $name = [string](Get-Val $s 'Name'); if (-not $name) { $m = [regex]::Match($xmlText, '<DataStore\b[^>]*?name="([^"]+)"'); if ($m.Success) { $name = $m.Groups[1].Value } }
+        , @($name, $(if ($fields.Count) { $fields -join ', ' } else { 'Field list not available' }))
+    }
+}
+
+function Get-AlertPolicyRows {
+    param([object[]]$AlertPolicies)
+    foreach ($a in $AlertPolicies) {
+        $state = if ((ConvertTo-CellValue (Get-Val $a 'Disabled')) -eq 'True') { 'Off' } else { 'On' }
+        $who = Get-ItemText (Get-Val $a 'NotifyUser'); if (-not $who) { $who = 'No email recipients' }
+        $agg = [string](Get-Val $a 'AggregationType'); $thr = [string](Get-Val $a 'Threshold'); $win = [string](Get-Val $a 'TimeWindow')
+        $trigger = switch ($agg) { 'None' { 'Every matching event' } 'SimpleAggregation' { $(if ($thr) { "$thr or more events in $win minutes" } else { 'Grouped events' }) } 'AnomalyAggregation' { 'Unusual volume of events' } default { $(if ($agg) { $agg } else { 'Every matching event' }) } }
+        , @([string]$a.Name, [string](Get-Val $a 'Severity'), $state, $trigger, $who)
+    }
+}
+
+function Get-TransportRuleRows {
+    param([object[]]$TransportRules)
+    foreach ($t in ($TransportRules | Sort-Object { [int]('0' + (Get-Val $_ 'Priority')) })) {
+        $desc = ([string](Get-Val $t 'Description')) -replace '\s*[\r\n]+\s*', ' ' -replace '\s{2,}', ' '
+        if ($desc.Length -gt 350) { $desc = $desc.Substring(0, 350) + ' ...' }
+        $sit = if (Get-Val $t 'MessageContainsDataClassifications') { 'Yes' } else { 'No' }
+        $mode = [string](Get-Val $t 'Mode'); $mode = switch ($mode) { 'Enforce' { 'Enforce' } 'Audit' { 'Test, no policy tips' } 'AuditAndNotify' { 'Test with policy tips' } default { $mode } }
+        , @([string]$t.Name, "$([string](Get-Val $t 'State')), $mode", $sit, $desc)
+    }
+}
+
+function Get-LabelNameMap {
+    param([object[]]$Labels)
+    $map = @{}
+    foreach ($l in $Labels) {
+        $dn = if ($l.DisplayName) { [string]$l.DisplayName } else { [string]$l.Name }
+        foreach ($k in @([string]$l.Guid, [string]$l.Name)) { if ($k -and -not $map.ContainsKey($k)) { $map[$k] = $dn } }
+    }
+    return $map
+}
+
+# ---------- Assessment analysis: licensing, coverage map, scenarios, hygiene checks, maturity, comparison ----------
+
+$Script:LicenceText = @{
+    Core     = 'Included in Microsoft 365 E3 / Business Premium'
+    Advanced = 'Microsoft 365 E5, E5 Information Protection & Governance, or Microsoft Purview Suite (formerly E5 Compliance)'
+    None     = 'No additional licence'
+}
+$Script:LicenceText['Teams'] = 'Teams chat and channel DLP: ' + $Script:LicenceText['Advanced']
+$Script:LicenceText['Copilot'] = $Script:LicenceText['Advanced'] + ', plus Microsoft 365 Copilot for the users in scope'
+$Script:LicenceText['Labels'] = 'Manual and default labelling: E3 / Business Premium. Automatic (service-side) labelling: ' + $Script:LicenceText['Advanced']
+$Script:LicenceText['Alerts'] = 'Single-event alerts: E3 / Business Premium. Volume-based (aggregated) alerts: ' + $Script:LicenceText['Advanced']
+$Script:TopicLicence = @{
+    'Microsoft Purview Data Loss Prevention' = 'Core'; 'Sensitive Information Types' = 'Core'; 'Custom Sensitive Information Types' = 'Core'; 'Exact Data Match' = 'Advanced'
+    'Trainable Classifiers' = 'Advanced'; 'Confidence Levels' = 'Core'; 'Sensitivity Labels and DLP' = 'Labels'; 'DLP Policies' = 'Core'; 'Conditions and Actions' = 'Core'
+    'Exchange Online DLP' = 'Core'; 'SharePoint Online DLP' = 'Core'; 'OneDrive DLP' = 'Core'; 'Microsoft Teams DLP' = 'Teams'; 'Endpoint DLP' = 'Advanced'
+    'USB and Removable Storage' = 'Advanced'; 'Printing' = 'Advanced'; 'Browser and Cloud Uploads' = 'Advanced'; 'Policy Tips' = 'Core'; 'Block with Override' = 'Core'
+    'DLP Simulation' = 'Core'; 'Activity Explorer' = 'Advanced'; 'DLP Alerts' = 'Alerts'; 'DLP and Microsoft 365 Copilot' = 'Copilot'; 'Operational Ownership' = 'None'
+    'Phased DLP Deployment' = 'Core'; 'Collection gaps' = 'None'; 'Content Explorer' = 'Advanced'; 'DLP Rule Activity' = 'Core'
+}
+
+function Get-LicenceKey {
+    <# Works out the licence an action needs from its area and wording. #>
+    param([string]$Area, [string]$Text)
+    $t = "$Area $Text"
+    if ($t -match 'Copilot') { return 'Copilot' }
+    if ($t -match 'Endpoint|device|USB|removable|print|browser|cloud upload') { return 'Advanced' }
+    if ($t -match 'Teams') { return 'Teams' }
+    if ($t -match 'Exact Data Match|\bEDM\b|trainable|Activity Explorer|Content Explorer') { return 'Advanced' }
+    if ($t -match 'auto-label|automatic label|auto label') { return 'Labels' }
+    if ($t -match 'alert') { return 'Alerts' }
+    if ($Area -match 'Ownership|Collection') { return 'None' }
+    return 'Core'
+}
+
+function Get-EffortText {
+    param([string]$Area, [string]$Text)
+    $t = "$Area $Text"
+    if ($t -match 'Endpoint|device|onboard|Exact Data Match|\bEDM\b|trainable|Copilot|No DLP policies') { return 'Large' }
+    if ($t -match 'polic|extend|Teams|label|simulation|enforce|overlap|tailor') { return 'Medium' }
+    return 'Small'
+}
+
+function Get-DataCategory {
+    param([string]$Name, [string]$RefType)
+    if ($RefType -eq 'SensitivityLabel') { return 'Labelled content' }
+    if ($Name -match 'password|\bkey\b|secret|token|connection string|credential|certificate|shared access') { return 'Credentials' }
+    if ($Name -match 'health|medical|NHS|drug enforcement|patient|ICD-|disease|medic') { return 'Health' }
+    if ($Name -match 'credit card|debit card|bank|IBAN|SWIFT|routing|account number|financial|tax|\bVAT\b|payment|sort code') { return 'Financial' }
+    if ($Name -match 'passport|national insurance|social security|identity|ID card|identification|driver|licen|full name|address|birth|citizen|residen|national ID|personal') { return 'Personal and ID' }
+    return 'Other'
+}
+$Script:DataCategories = @('Financial', 'Health', 'Personal and ID', 'Credentials', 'Labelled content', 'Other')
+$Script:MapLocations = [ordered]@{ Exchange = 'Email (Exchange)'; SharePoint = 'SharePoint'; OneDrive = 'OneDrive'; Teams = 'Teams'; Endpoint = 'Devices'; Copilot = 'Copilot' }
+
+function Get-RuleLevel {
+    <# Strength of a rule's response: 4 block, 3 override/warn, 2 notify, 1 audit. Endpoint uses the device restrictions. #>
+    param($RuleSum, [object[]]$EndpointActions, [switch]$ForDevices)
+    if ($ForDevices) {
+        $vals = @($EndpointActions | Where-Object { $_.Policy -eq $RuleSum.Policy -and $_.Rule -eq $RuleSum.Rule } | ForEach-Object { [string]$_.Value })
+        if ($vals -match '^Block') { return 4 }
+        if ($vals -match 'Warn|Override') { return 3 }
+        if ($vals.Count) { return 1 }
+    }
+    switch ($RuleSum.ResponseInterpretation) {
+        'Block' { return 4 } 'Block with override' { return 3 } 'Notify / policy tip' { return 2 } default { return 1 }
+    }
+}
+
+function Get-CoverageMap {
+    <# Rows: location x data category, with the strongest response that applies. #>
+    param([object[]]$Coverage, [object[]]$RuleSum, [object[]]$ClassRows, [object[]]$EndpointActions)
+    $cell = @{}
+    foreach ($r in $RuleSum) {
+        if ((ConvertTo-CellValue $r.Disabled) -eq 'True') { continue }
+        $pc = $Coverage | Where-Object { $_.Policy -eq $r.Policy } | Select-Object -First 1
+        if (-not $pc -or $pc.Mode -eq 'Disable') { continue }
+        $sim = [string]$pc.Mode -like 'Test*'
+        $cats = @($ClassRows | Where-Object { $_.Policy -eq $r.Policy -and $_.Rule -eq $r.Rule -and $_.Source -ne 'Exception' } | ForEach-Object { Get-DataCategory ([string]$_.Name) $_.ReferenceType } | Select-Object -Unique)
+        if ($cats.Count -eq 0) { $cats = @('Other') }
+        foreach ($loc in $Script:MapLocations.Keys) {
+            if (-not $pc.$loc) { continue }
+            $lvl = if ($sim) { 0.5 } else { Get-RuleLevel -RuleSum $r -EndpointActions $EndpointActions -ForDevices:($loc -eq 'Endpoint') }
+            foreach ($c in $cats) { $k = "$loc|$c"; if (-not $cell.ContainsKey($k) -or $cell[$k] -lt $lvl) { $cell[$k] = $lvl } }
+        }
+    }
+    foreach ($loc in $Script:MapLocations.Keys) {
+        $row = [ordered]@{ Location = $Script:MapLocations[$loc] }
+        foreach ($c in $Script:DataCategories) {
+            $k = "$loc|$c"
+            $row[$c] = if (-not $cell.ContainsKey($k)) { '' } else {
+                switch ($cell[$k]) { 4 { 'Block' } 3 { $(if ($loc -eq 'Endpoint') { 'Warn' } else { 'Override' }) } 2 { 'Notify' } 1 { 'Audit only' } default { 'Simulation' } }
+            }
+        }
+        [pscustomobject]$row
+    }
+}
+
+function Get-MapCellMarkup {
+    param([string]$Value)
+    switch ($Value) { 'Block' { '[[G]]Block' } 'Override' { '[[G]]Override' } 'Warn' { '[[G]]Warn' } 'Notify' { '[[A]]Notify' } 'Audit only' { '[[A]]Audit only' } 'Simulation' { '[[A]]Simulation' } default { '[[N]]-' } }
+}
+
+function Get-ScenarioText {
+    <# One plain-English "what actually happens" paragraph for a rule. #>
+    param($Rule, $RuleSum, $Policy, [object[]]$ClassRows, [hashtable]$LabelNames, [object[]]$EndpointActions)
+    $locs = @()
+    $wl = [string](ConvertTo-CellValue (Get-Val $Policy 'Workload'))
+    if ($wl -match 'Exchange') { $locs += 'emails' }
+    if ($wl -match 'SharePoint|OneDrive') { $locs += 'shares a file' }
+    if ($wl -match 'Teams') { $locs += 'posts a Teams message' }
+    $device = $wl -match 'Endpoint'
+    if ($device -and $locs.Count -eq 0) { $locs += 'copies, prints or uploads a file on a device' }
+    if ($locs.Count -eq 0) { $locs += 'works with content' }
+    $verb = if ($locs.Count -gt 1) { (($locs[0..($locs.Count - 2)]) -join ', ') + ' or ' + $locs[-1] } else { $locs[0] }
+    $cond = @($ClassRows | Where-Object { $_.Source -ne 'Exception' })
+    $what = if ($cond.Count -eq 0) { 'sensitive content' } else {
+        $first = $cond[0]
+        $nm = [string]$first.Name
+        if ($first.ReferenceType -eq 'SensitivityLabel') { $n2 = if ($LabelNames.ContainsKey($nm)) { $LabelNames[$nm] } else { $nm }; "content labelled **$n2**" }
+        else {
+            $min = [int]('0' + [string]$first.MinCount)
+            $t = if ($min -gt 1) { "**$min or more** items of **$nm**" } else { "a **$nm**" }
+            if ($cond.Count -gt 1) { $t += " (or any of the other $($cond.Count - 1) listed types)" }
+            $t
+        }
+    }
+    $scope = [string](Get-Val $Rule 'AccessScope')
+    $who = if ($scope -eq 'NotInOrganization') { ' with someone **outside the organisation**' } elseif ($scope -eq 'InOrganization') { ' inside the organisation' } else { '' }
+    $mode = [string]$Policy.Mode
+    $outcome = @()
+    if ($mode -eq 'TestWithoutNotifications') { $outcome += 'nothing is blocked and the user sees nothing, because the policy is in silent simulation. The match is only recorded for review' }
+    elseif ($mode -eq 'TestWithNotifications') { $outcome += 'the user may see a policy tip, but nothing is blocked because the policy is in simulation' }
+    elseif ($mode -eq 'Disable') { $outcome += 'nothing happens, because the policy is disabled' }
+    else {
+        switch ($RuleSum.ResponseInterpretation) {
+            'Block' { $outcome += 'the action is **blocked**' }
+            'Block with override' { $outcome += 'the action is **blocked unless the user overrides it** with a business justification' }
+            'Notify / policy tip' { $outcome += 'the action **goes ahead**; the user is warned with a policy tip and/or email' }
+            default { if (-not $device) { $outcome += 'the action **goes ahead** and the user is not told; the event is only recorded' } }
+        }
+        if ($device) {
+            $ea = @($EndpointActions | Where-Object { $_.Policy -eq $RuleSum.Policy -and $_.Rule -eq $RuleSum.Rule })
+            foreach ($e in $ea) {
+                $nm = if ($Script:EndpointActionNames.ContainsKey([string]$e.Setting)) { $Script:EndpointActionNames[[string]$e.Setting] } else { ConvertFrom-CamelCase ([string]$e.Setting) }
+                $outcome += "on a device, **$($nm.ToLower())** is $(switch -Regex ([string]$e.Value) { '^Block' { 'blocked' } 'Warn|Override' { 'warned (the user can continue)' } default { 'audited only' } })"
+            }
+        }
+        $alert = ConvertTo-CellValue (Get-Val $Rule 'GenerateAlert')
+        if ($alert) { $outcome += 'an **alert** is raised for the security team' }
+        $inc = ConvertTo-CellValue (Get-Val $Rule 'GenerateIncidentReport')
+        if ($inc) { $outcome += "an incident report is emailed to $(Get-PersonText ($inc -split ' \| '))" }
+    }
+    if ($outcome.Count -eq 0) { $outcome = @('the action goes ahead and the event is recorded') }
+    $o = if ($outcome.Count -gt 1) { (($outcome[0..($outcome.Count - 2)]) -join '; ') + '; and ' + $outcome[-1] } else { $outcome[0] }
+    return "If someone $verb containing $what$who, $o."
+}
+
+function Get-HygieneChecks {
+    param([object[]]$Policies, [object[]]$PolSum, [object[]]$Rules, [object[]]$RuleSum, [object[]]$ClassRows, [object[]]$Coverage,
+        [object[]]$SitView, [object[]]$Labels, [object[]]$LabelPolicies, [object[]]$AlertPolicies, [object[]]$CeCounts, [object[]]$Activity, [bool]$ActivityCollected)
+    $out = [System.Collections.Generic.List[object]]::new()
+    function Add-Check { param($Name, $Status, $Detail, $Advice) $out.Add([pscustomobject][ordered]@{ Check = $Name; Status = $Status; Detail = $Detail; Advice = $Advice }) }
+
+    # 1 Unchanged templates
+    $tpl = @($PolSum | Where-Object { [string]$_.Comment -match '^Helps detect the presence of information commonly considered' })
+    $tplRules = @($RuleSum | Where-Object { $_.Rule -match '^(Low|High) volume of content detected' })
+    if ($Policies.Count -eq 0) { Add-Check 'Policies tailored to the organisation' 'N' 'No DLP policies.' '' }
+    elseif ($tpl.Count -or $tplRules.Count) { Add-Check 'Policies tailored to the organisation' 'A' "$(Get-Plural $tpl.Count 'policy still uses' 'policies still use') Microsoft's template description and $(Get-Plural $tplRules.Count 'rule keeps' 'rules keep') the template rule name ($(@($tpl | ForEach-Object Name) -join ', '))." 'Review each template against the organisation''s own data, thresholds and responses, then rename and describe it so its purpose is clear.' }
+    else { Add-Check 'Policies tailored to the organisation' 'G' 'No policies appear to be unchanged Microsoft templates.' '' }
+
+    # 2 High-volume / high-severity rules that do not block
+    $weak = @($RuleSum | Where-Object { ($_.Rule -match 'High volume' -or [string]$_.ReportSeverityLevel -eq 'High') -and $_.ResponseInterpretation -notmatch '^Block' })
+    if ($RuleSum.Count -eq 0) { Add-Check 'High-risk rules take action' 'N' 'No rules.' '' }
+    elseif ($weak.Count) { Add-Check 'High-risk rules take action' 'R' "$(Get-Plural $weak.Count 'high-volume or high-severity rule does' 'high-volume or high-severity rules do') not block or require an override: $(@($weak | ForEach-Object Rule) -join '; ')." 'For the highest-risk cases (large volumes, external sharing), use block with override at least, after a period in simulation.' }
+    else { Add-Check 'High-risk rules take action' 'G' 'High-volume and high-severity rules block or require an override.' '' }
+
+    # 3 Alert recipients
+    $adminOnly = @($AlertPolicies | Where-Object { $u = @(Get-Val $_ 'NotifyUser' | ForEach-Object { [string]$_ }); $u.Count -gt 0 -and -not ($u | Where-Object { $_ -notmatch '^(TenantAdmins|SiteAdmin)$' }) })
+    $noRecipients = @($AlertPolicies | Where-Object { -not (Get-Val $_ 'NotifyUser') })
+    if ($AlertPolicies.Count -eq 0) { Add-Check 'Alerts reach a named team' 'N' 'No DLP alert policies.' '' }
+    elseif ($adminOnly.Count -or $noRecipients.Count) { Add-Check 'Alerts reach a named team' 'A' "$(Get-Plural ($adminOnly.Count + $noRecipients.Count) 'alert policy emails' 'alert policies email') only tenant admins or nobody." 'Send DLP alerts to a monitored shared mailbox or security team with a documented triage process.' }
+    else { Add-Check 'Alerts reach a named team' 'G' 'Alert policies email named recipients.' '' }
+
+    # 4 Overlapping rules (same detection, overlapping locations, different policies)
+    $sig = @{}
+    foreach ($r in $RuleSum) {
+        $names = @($ClassRows | Where-Object { $_.Policy -eq $r.Policy -and $_.Rule -eq $r.Rule -and $_.Source -ne 'Exception' } | ForEach-Object { "$($_.Name):$($_.MinCount)" } | Sort-Object -Unique)
+        if ($names.Count -eq 0) { continue }
+        $k = $names -join ','
+        if (-not $sig.ContainsKey($k)) { $sig[$k] = [System.Collections.Generic.List[object]]::new() }
+        $sig[$k].Add($r)
+    }
+    $dups = @($sig.Values | Where-Object { @($_ | Select-Object -ExpandProperty Policy -Unique).Count -gt 1 })
+    if ($dups.Count) { Add-Check 'No overlapping rules' 'A' "$(Get-Plural $dups.Count 'set of rules looks' 'sets of rules look') for the same information in different policies: $(@($dups | ForEach-Object { (@($_ | ForEach-Object { "$($_.Policy) / $($_.Rule)" })) -join ' and ' }) -join '; ')." 'Check the overlap is intended; duplicate rules generate duplicate alerts and conflicting user experiences.' }
+    elseif ($RuleSum.Count) { Add-Check 'No overlapping rules' 'G' 'No rules with identical detection were found in different policies.' '' }
+
+    # 5 Stale configuration
+    $old = @($PolSum | Where-Object { try { $_.WhenChangedUTC -and ([datetime]$_.WhenChangedUTC) -lt (Get-Date).AddMonths(-12) } catch { $false } })
+    if ($Policies.Count -and $old.Count) { Add-Check 'Configuration reviewed in the last 12 months' 'A' "$(Get-Plural $old.Count 'policy has' 'policies have') not changed for over 12 months: $(@($old | ForEach-Object Name) -join ', ')." 'Review policies at least annually, and whenever the organisation''s data or regulations change.' }
+    elseif ($Policies.Count) { Add-Check 'Configuration reviewed in the last 12 months' 'G' 'All policies have been changed within the last 12 months.' '' }
+
+    # 6 Simulation left running
+    $simOld = @($PolSum | Where-Object { [string]$_.Mode -like 'Test*' -and $(try { ([datetime]$_.WhenChangedUTC) -lt (Get-Date).AddDays(-30) } catch { $false }) })
+    if ($simOld.Count) { Add-Check 'Simulation has an end date' 'A' "$(Get-Plural $simOld.Count 'policy has' 'policies have') been in simulation for over 30 days: $(@($simOld | ForEach-Object Name) -join ', ')." 'Review simulation results and set a date to enforce or retire each policy.' }
+    elseif ($Policies.Count) { Add-Check 'Simulation has an end date' 'G' 'No policies have been left in simulation for more than 30 days.' '' }
+
+    # 7 Disabled rules
+    $dis = @($RuleSum | Where-Object { (ConvertTo-CellValue $_.Disabled) -eq 'True' })
+    if ($dis.Count) { Add-Check 'No disabled rules left behind' 'A' "$(Get-Plural $dis.Count 'rule is' 'rules are') disabled: $(@($dis | ForEach-Object Rule) -join '; ')." 'Remove disabled rules that are no longer needed so the configuration stays easy to understand.' }
+    elseif ($RuleSum.Count) { Add-Check 'No disabled rules left behind' 'G' 'No disabled rules.' '' }
+
+    # 8 Default policy tips
+    $tips = @($RuleSum | Where-Object { $_.NotifyUser }); $custom = @($tips | Where-Object { $_.NotifyPolicyTipCustomText })
+    if ($tips.Count -and $custom.Count -eq 0) { Add-Check 'Policy tips use organisation wording' 'A' 'All policy tips use Microsoft''s default text.' 'Write short tips that say what is wrong, what to do and who to contact.' }
+    elseif ($tips.Count) { Add-Check 'Policy tips use organisation wording' 'G' "$($custom.Count) of $($tips.Count) notifying rules use custom tip text." '' }
+
+    # 9 Unused custom SITs
+    $unusedSit = @($SitView | Where-Object { $_.IsCustom -and -not $_.UsedInDlpRules })
+    if ($unusedSit.Count) { Add-Check 'Custom detectors are used' 'A' "$(Get-Plural $unusedSit.Count 'custom sensitive information type is' 'custom sensitive information types are') not used by any rule: $(@($unusedSit | Select-Object -First 10 | ForEach-Object Name) -join ', ')." 'Use them in a policy or remove them.' }
+    elseif (@($SitView | Where-Object IsCustom).Count) { Add-Check 'Custom detectors are used' 'G' 'All custom sensitive information types are used in rules.' '' }
+
+    # 10 Labels not published
+    $published = @{}
+    foreach ($lp in $LabelPolicies) { foreach ($l in @(Get-Val $lp 'Labels') + @(Get-Val $lp 'ScopedLabels')) { $published[[string](Get-ItemText $l)] = $true } }
+    $unpub = @($Labels | Where-Object { -not ($published.ContainsKey([string]$_.Name) -or $published.ContainsKey([string]$_.Guid) -or $published.ContainsKey([string]$_.DisplayName)) })
+    if ($Labels.Count -and $unpub.Count) { Add-Check 'Labels are published' 'A' "$(Get-Plural $unpub.Count 'label is' 'labels are') not in any label policy: $(@($unpub | ForEach-Object { if ($_.DisplayName) { $_.DisplayName } else { $_.Name } }) -join ', ')." 'Publish the labels users need, or remove unused ones.' }
+    elseif ($Labels.Count) { Add-Check 'Labels are published' 'G' 'All labels are published in at least one label policy.' '' }
+
+    # 11 Sensitive data stored but not protected (Content Explorer)
+    if ($CeCounts.Count) {
+        $unprot = @($CeCounts | Where-Object { $_.TagType -eq 'SensitiveInformationType' -and -not $_.UsedInDlpRules -and $_.ItemCount -gt 0 } | Group-Object TagName | ForEach-Object { "$($_.Name) ($('{0:N0}' -f ($_.Group | Measure-Object ItemCount -Sum).Sum) items)" })
+        if ($unprot.Count) { Add-Check 'Stored sensitive data is covered by a rule' 'R' "Content Explorer found data that no DLP rule looks for: $($unprot -join '; ')." 'Decide whether this information needs protecting and, if so, add it to a policy.' }
+        else { Add-Check 'Stored sensitive data is covered by a rule' 'G' 'Every sensitive information type found by Content Explorer is used in a DLP rule.' '' }
+    }
+    else { Add-Check 'Stored sensitive data is covered by a rule' 'N' 'Content Explorer counts were not collected.' 'Run the complete report with Content Explorer enabled (needs the Content Explorer List Viewer role).' }
+
+    # 12 Rules that never fire / heavy overrides
+    if ($ActivityCollected) {
+        $active = @{}; foreach ($a in $Activity) { $active["$($a.Policy)|$($a.Rule)"] = $a }
+        $silent = @($RuleSum | Where-Object { -not $active.ContainsKey("$($_.Policy)|$($_.Rule)") })
+        $heavy = @($Activity | Where-Object { $_.Matches -ge 10 -and ($_.Overrides + $_.FalsePositives) / [double]$_.Matches -ge 0.3 })
+        if ($heavy.Count) { Add-Check 'Rules are not routinely overridden' 'R' "$(Get-Plural $heavy.Count 'rule is' 'rules are') overridden or reported as false positives in 30% or more of matches: $(@($heavy | ForEach-Object Rule) -join '; ')." 'Review the justifications; tune thresholds or exceptions so users only see the rule when it matters.' }
+        else { Add-Check 'Rules are not routinely overridden' 'G' 'No rule has a high override or false-positive rate.' '' }
+        if ($silent.Count) { Add-Check 'Rules are triggering' 'A' "$(Get-Plural $silent.Count 'rule had' 'rules had') no matches in the audit period: $(@($silent | Select-Object -First 10 | ForEach-Object Rule) -join '; ')." 'Confirm the rule still detects what it should (test with sample data) or retire it.' }
+        else { Add-Check 'Rules are triggering' 'G' 'Every rule matched at least once in the audit period.' '' }
+    }
+    else { Add-Check 'Rules are triggering' 'N' 'DLP rule activity was not collected.' 'Run the complete report with DLP rule activity enabled (needs Exchange Online and an audit log reader role).' }
+    $out
+}
+
+function Get-MaturityScores {
+    param([object[]]$Policies, [object[]]$RuleSum, [object[]]$ClassRows, [hashtable]$CovCount, [object[]]$SitView, [object[]]$Edm, [object[]]$Labels,
+        [object[]]$LabelPolicies, [object[]]$AutoPolicies, [object[]]$AlertPolicies, [object[]]$RoleMembers, [object[]]$Hygiene, [bool]$AuditOn, [bool]$EvidenceCollected)
+    $rows = [System.Collections.Generic.List[object]]::new()
+    function Add-Score { param($Dim, [int]$Score, $Evidence, $Next) $rows.Add([pscustomobject][ordered]@{ Dimension = $Dim; Score = [Math]::Max(0, [Math]::Min(5, $Score)); Evidence = $Evidence; NextStep = $Next }) }
+
+    $core = @('Exchange', 'SharePoint', 'OneDrive', 'Teams', 'Endpoint', 'Copilot' | Where-Object { $CovCount[$_] -gt 0 })
+    $s = [int][Math]::Round(5 * $core.Count / 6)
+    Add-Score 'Coverage' $s "$($core.Count) of 6 core locations have an enforced policy ($($core -join ', '))." $(if ($s -lt 5) { "Extend protection to: $(@('Exchange', 'SharePoint', 'OneDrive', 'Teams', 'Endpoint', 'Copilot' | Where-Object { $core -notcontains $_ }) -join ', ')." } else { 'Maintain coverage as new services are adopted.' })
+
+    $active = @($RuleSum | Where-Object { (ConvertTo-CellValue $_.Disabled) -ne 'True' })
+    $strong = @($active | Where-Object { $_.ResponseInterpretation -match '^Block' -or $_.ResponseInterpretation -like 'Endpoint*' })
+    $notify = @($active | Where-Object { $_.ResponseInterpretation -eq 'Notify / policy tip' })
+    $custTip = @($active | Where-Object { $_.NotifyPolicyTipCustomText })
+    $s = if ($active.Count -eq 0) { 0 } elseif ($strong.Count -eq 0 -and $notify.Count -eq 0) { 1 } elseif ($strong.Count -eq 0) { 2 } elseif ($strong.Count / [double]$active.Count -lt 0.5) { 3 } elseif ($custTip.Count -eq 0) { 4 } else { 5 }
+    Add-Score 'Enforcement' $s "$($strong.Count) of $($active.Count) active rules block, require an override or restrict devices; $($notify.Count) only notify." $(switch ($s) { 0 { 'Create rules for the agreed use cases.' } 1 { 'Turn on user notifications so people learn the policy.' } 2 { 'Move the highest-risk rules to block with override.' } 3 { 'Extend blocking to more high-risk rules.' } 4 { 'Add custom policy tip wording.' } default { 'Keep tuning with real activity data.' } })
+
+    $sitRefs = @($ClassRows | Where-Object { $_.ReferenceType -eq 'Classifier' }); $labRefs = @($ClassRows | Where-Object { $_.ReferenceType -eq 'SensitivityLabel' })
+    $tiers = @($sitRefs | Where-Object { [int]('0' + [string]$_.MinCount) -gt 1 }).Count -gt 0
+    $customUsed = @($SitView | Where-Object { $_.IsCustom -and $_.UsedInDlpRules }).Count
+    $advanced = @($sitRefs | Where-Object { $_.ClassifierType -match 'MLModel|Trainable|ExactMatch|EDM' }).Count
+    $s = if ($sitRefs.Count -eq 0 -and $labRefs.Count -eq 0) { 0 } else { 1 + [int]$tiers + [int]($labRefs.Count -gt 0) + [int]($customUsed -gt 0) + [int]($advanced -gt 0 -or $Edm.Count -gt 0) }
+    Add-Score 'Detection' $s "$(@($sitRefs | Select-Object -ExpandProperty Name -Unique).Count) sensitive information types in rules; volume tiers: $(if ($tiers) { 'yes' } else { 'no' }); labels as conditions: $($labRefs.Count); custom types in use: $customUsed; EDM or trainable classifiers: $advanced." $(if ($s -lt 5) { 'Add organisation-specific detection: custom types, labels as conditions, EDM or trainable classifiers.' } else { 'Review detection accuracy with simulation and false-positive data.' })
+
+    $mand = @($LabelPolicies | Where-Object { (@(Get-Val $_ 'Settings') -join ' ') -match '\[mandatory, true\]|\[defaultlabelid, [^\]]+\]' })
+    $s = if ($Labels.Count -eq 0) { 0 } elseif ($LabelPolicies.Count -eq 0) { 1 } else { 2 + [int]($mand.Count -gt 0) + [int]($AutoPolicies.Count -gt 0) + [int]($labRefs.Count -gt 0) }
+    Add-Score 'Labelling integration' $s "$($Labels.Count) labels, $($LabelPolicies.Count) label policies ($($mand.Count) with mandatory or default labelling), $($AutoPolicies.Count) auto-labelling policies, labels used in DLP: $($labRefs.Count)." $(if ($labRefs.Count -eq 0 -and $Labels.Count) { 'Use labels as DLP conditions so labelled content is protected wherever it goes.' } elseif ($AutoPolicies.Count -eq 0 -and $Labels.Count) { 'Add auto-labelling for the most sensitive information.' } else { 'Review label adoption and accuracy.' })
+
+    $alertRules = @($RuleSum | Where-Object { $_.GenerateAlert -or $_.GenerateIncidentReport })
+    $named = @($AlertPolicies | Where-Object { @(Get-Val $_ 'NotifyUser' | ForEach-Object { [string]$_ } | Where-Object { $_ -notmatch '^(TenantAdmins|SiteAdmin)$' }).Count -gt 0 })
+    $s = [int]($alertRules.Count -gt 0) + [int]($named.Count -gt 0) + [int]$AuditOn + [int]$EvidenceCollected + [int](@($RoleMembers).Count -gt 0)
+    Add-Score 'Operations and monitoring' $s "Rules raising alerts: $($alertRules.Count); alert policies to a named team: $($named.Count); unified audit log on: $(if ($AuditOn) { 'yes' } else { 'no / not checked' }); rule activity reviewed in this assessment: $(if ($EvidenceCollected) { 'yes' } else { 'no' }); people with DLP roles: $(@($RoleMembers | Select-Object -ExpandProperty Member -Unique).Count)." 'Route alerts to a named team, agree a review cadence and record who owns each policy.'
+
+    $enf = @($Policies | Where-Object { $_.Mode -eq 'Enable' }).Count
+    $issues = @($Hygiene | Where-Object { $_.Status -in 'R', 'A' }).Count
+    $s = if ($Policies.Count -eq 0) { 0 } elseif ($enf -eq 0) { 2 } elseif ($issues -ge 4) { 3 } elseif ($issues -ge 1) { 4 } else { 5 }
+    Add-Score 'Lifecycle and hygiene' $s "$enf of $($Policies.Count) policies enforced; $issues hygiene checks need attention." 'Fix the hygiene items in section 15 and review the configuration at least annually.'
+    $rows
+}
+
+function Get-MaturityLevel {
+    param([double]$Score)
+    if ($Score -lt 1) { 'Initial' } elseif ($Score -lt 2) { 'Developing' } elseif ($Score -lt 3) { 'Defined' } elseif ($Score -lt 4) { 'Managed' } else { 'Optimised' }
+}
+
+function Get-ScoreBar {
+    param([int]$Score)
+    $full = [string][char]0x25A0; $empty = [string][char]0x25A1
+    ($full * $Score) + ($empty * (5 - $Score))
+}
+
+function ConvertTo-DateSafe {
+    <# Reads dates written by either PowerShell 5.1 (/Date(ms)/) or PowerShell 7 (ISO 8601). Returns $null if unreadable. #>
+    param($Value)
+    if ($null -eq $Value -or $Value -eq '') { return $null }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime() }
+    $m = [regex]::Match([string]$Value, 'Date\((-?\d+)')
+    if ($m.Success) { return [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$m.Groups[1].Value).UtcDateTime }
+    try { return ([datetime]::Parse([string]$Value, [Globalization.CultureInfo]::InvariantCulture)).ToUniversalTime() } catch { return $null }
+}
+
+function Find-PreviousRun {
+    <# Latest earlier complete-report folder for the same tenant, or $null. #>
+    param([string]$TenantId)
+    $dirs = @(Get-ChildItem -Path $Script:Settings.OutputRoot -Directory -Filter 'M365-DLP-Full-*' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne $Script:OutputDir } | Sort-Object Name -Descending)
+    foreach ($d in $dirs) {
+        $ti = Join-Path $d.FullName '01_Tenant_Info.json'
+        if (-not (Test-Path (Join-Path $d.FullName '10_DLP_Policies_Full.json'))) { continue }
+        if (-not $TenantId) { return $d.FullName }
+        try { if ((Get-Content $ti -Raw | ConvertFrom-Json).TenantId -eq $TenantId) { return $d.FullName } } catch { }
+    }
+    return $null
+}
+
+function Read-RunFile {
+    param([string]$Folder, [string]$Name)
+    $p = Join-Path $Folder "$Name.json"
+    if (-not (Test-Path $p)) { return @() }
+    try { return @(Get-Content $p -Raw -Encoding UTF8 | ConvertFrom-Json | ForEach-Object { $_ }) } catch { return @() }
+}
+
+function Get-ChangesSinceLastRun {
+    param([string]$Folder, [object[]]$Policies, [object[]]$Rules, [object[]]$Labels, [object[]]$LabelPolicies, [object[]]$AlertPolicies)
+    $out = [System.Collections.Generic.List[object]]::new()
+    function Add-Change { param($Type, $Name, $Change) $out.Add([pscustomobject][ordered]@{ Item = $Type; Name = $Name; Change = $Change }) }
+    function Compare-Set {
+        param([string]$Type, [object[]]$Old, [object[]]$New, [scriptblock]$Key, [scriptblock]$Describe)
+        $o = @{}; foreach ($x in $Old) { $k = [string](& $Key $x); if ($k) { $o[$k] = $x } }
+        $n = @{}; foreach ($x in $New) { $k = [string](& $Key $x); if ($k) { $n[$k] = $x } }
+        foreach ($k in $n.Keys) {
+            if (-not $o.ContainsKey($k)) { Add-Change $Type $k 'Added' }
+            else { $d = & $Describe $o[$k] $n[$k]; if ($d) { Add-Change $Type $k $d } }
+        }
+        foreach ($k in $o.Keys) { if (-not $n.ContainsKey($k)) { Add-Change $Type $k 'Removed' } }
+    }
+    $modeText = @{ 'Enable' = 'Enforced'; 'TestWithNotifications' = 'Simulation with tips'; 'TestWithoutNotifications' = 'Silent simulation'; 'Disable' = 'Disabled' }
+    $chg = { param($a, $b)
+        $ca = ConvertTo-DateSafe (Get-Val $a 'WhenChangedUTC'); $cb = ConvertTo-DateSafe (Get-Val $b 'WhenChangedUTC')
+        if ($ca -and $cb -and $cb -gt $ca.AddMinutes(1)) { return "Modified $($cb.ToString('dd MMM yyyy'))" }
+        return '' }
+    Compare-Set 'DLP policy' (Read-RunFile $Folder '10_DLP_Policies_Full') $Policies { param($x) $x.Name } {
+        param($a, $b)
+        $ma = [string]$a.Mode; $mb = [string]$b.Mode
+        if ($ma -ne $mb) { return "Mode: $(if ($modeText[$ma]) { $modeText[$ma] } else { $ma }) -> $(if ($modeText[$mb]) { $modeText[$mb] } else { $mb })" }
+        & $chg $a $b }
+    Compare-Set 'DLP rule' (Read-RunFile $Folder '13_DLP_Rules_Full') $Rules { param($x) "$(Get-Val $x 'ParentPolicyName') / $($x.Name)" } {
+        param($a, $b)
+        $da = [string](Get-Val $a 'Disabled'); $db = [string](Get-Val $b 'Disabled')
+        if ($da -ne $db) { return $(if ($db -eq 'True') { 'Disabled' } else { 'Enabled' }) }
+        & $chg $a $b }
+    Compare-Set 'Sensitivity label' (Read-RunFile $Folder '30_Sensitivity_Labels') $Labels { param($x) if ($x.DisplayName) { $x.DisplayName } else { $x.Name } } $chg
+    Compare-Set 'Label policy' (Read-RunFile $Folder '31_Sensitivity_Label_Policies') $LabelPolicies { param($x) $x.Name } $chg
+    Compare-Set 'Alert policy' (Read-RunFile $Folder '51_Alert_Policies_DLP') $AlertPolicies { param($x) $x.Name } { param($a, $b) $da = [string](Get-Val $a 'Disabled'); $db = [string](Get-Val $b 'Disabled'); if ($da -ne $db) { if ($db -eq 'True') { 'Turned off' } else { 'Turned on' } } }
+    $out
+}
+
+function Add-DocImage {
+    <# Adds a PNG or JPEG image as its own paragraph. WidthCm keeps the aspect ratio. #>
+    param([string]$Path, [double]$WidthCm = 5, [string]$Align = 'left')
+    if (-not $Path -or -not (Test-Path $Path)) { return }
+    $bytes = [IO.File]::ReadAllBytes((Resolve-Path $Path).Path)
+    $ext = [IO.Path]::GetExtension($Path).ToLower().TrimStart('.')
+    if ($ext -eq 'jpg') { $ext = 'jpeg' }
+    if ($ext -notin 'png', 'jpeg') { Write-Log "Logo must be a PNG or JPEG file: $Path" 'WARN'; return }
+    $w = 0; $h = 0
+    if ($ext -eq 'png' -and $bytes.Length -gt 24) {
+        $w = ([int]$bytes[16] -shl 24) -bor ([int]$bytes[17] -shl 16) -bor ([int]$bytes[18] -shl 8) -bor [int]$bytes[19]
+        $h = ([int]$bytes[20] -shl 24) -bor ([int]$bytes[21] -shl 16) -bor ([int]$bytes[22] -shl 8) -bor [int]$bytes[23]
+    }
+    else {
+        try { Add-Type -AssemblyName System.Drawing -ErrorAction Stop; $img = [System.Drawing.Image]::FromFile((Resolve-Path $Path).Path); $w = $img.Width; $h = $img.Height; $img.Dispose() } catch { }
+    }
+    if ($w -le 0 -or $h -le 0) { $w = 3; $h = 1 }
+    $cx = [int64]($WidthCm * 360000); $cy = [int64]($cx * $h / $w)
+    $n = $Script:Doc.Media.Count + 1
+    $name = "image$n.$ext"
+    $id = "rIdImg$n"
+    $Script:Doc.Media.Add(@{ Name = $name; Bytes = $bytes })
+    $Script:Doc.Rels.Add("<Relationship Id=`"$id`" Type=`"http://schemas.openxmlformats.org/officeDocument/2006/relationships/image`" Target=`"media/$name`"/>")
+    $picId = 500 + $n
+    Add-DocXml ("<w:p><w:pPr><w:spacing w:before=`"0`" w:after=`"200`"/><w:jc w:val=`"$Align`"/></w:pPr><w:r><w:drawing><wp:inline distT=`"0`" distB=`"0`" distL=`"0`" distR=`"0`"><wp:extent cx=`"$cx`" cy=`"$cy`"/><wp:docPr id=`"$picId`" name=`"Logo $n`"/>" +
+        "<a:graphic xmlns:a=`"http://schemas.openxmlformats.org/drawingml/2006/main`"><a:graphicData uri=`"http://schemas.openxmlformats.org/drawingml/2006/picture`"><pic:pic xmlns:pic=`"http://schemas.openxmlformats.org/drawingml/2006/picture`">" +
+        "<pic:nvPicPr><pic:cNvPr id=`"$picId`" name=`"$name`"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed=`"$id`"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill>" +
+        "<pic:spPr><a:xfrm><a:off x=`"0`" y=`"0`"/><a:ext cx=`"$cx`" cy=`"$cy`"/></a:xfrm><a:prstGeom prst=`"rect`"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>")
+}
+
+function Export-ActionPlan {
+    <# Prioritised action plan from the report observations, with effort and licence. Written as 80_Action_Plan. #>
+    $order = @{ 'High' = 0; 'Medium' = 1; 'Low' = 2; 'Info' = 3 }
+    $n = 0
+    $rows = foreach ($o in @($Script:ReportObs | Sort-Object { $order[$_.Severity] })) {
+        $n++
+        [pscustomobject][ordered]@{
+            Id = $n; Priority = $o.Severity; Area = $o.Area; Action = ($o.Text -replace '\*\*', '')
+            Effort = Get-EffortText $o.Area $o.Text; Licence = $Script:LicenceText[(Get-LicenceKey $o.Area $o.Text)]
+            Owner = ''; TargetDate = ''; Status = 'Not started'; Notes = ''
+        }
+    }
+    $Script:Cache['ActionPlan'] = @($rows)
+    Export-Dataset '80_Action_Plan' @($rows) -AlreadyFlat
+}
+
+function Add-ReportPartError {
+    <# Keeps the rest of the report when one generated part fails. #>
+    param([string]$Part, $ErrorRecord)
+    $msg = $ErrorRecord.Exception.Message
+    Write-Log "  Report part '$Part' could not be built: $msg" 'WARN'
+    $Script:Errors.Add([pscustomobject]@{ Step = "Word report: $Part"; Outcome = 'Failed'; Error = $msg })
+    Add-DocCallout 'Not available:' "This part of the report could not be generated ($msg). The rest of the report is unaffected." 'FFF4E5' 'E08A00'
+}
+
 function New-DlpWordReport {
     <# Builds DLP_Assessment_Report.docx from the data collected by the complete report. #>
     Write-Log 'Building Word assessment report...'
@@ -1788,6 +2819,13 @@ function New-DlpWordReport {
     $summaryRows = @($Script:Cache['SummaryRows'])
     $classRefs = @($rc | Where-Object ReferenceType -eq 'Classifier')
     $labelRefs = @($rc | Where-Object ReferenceType -eq 'SensitivityLabel')
+    $labelNames = Get-LabelNameMap $labels
+    $autoRules = @(Get-AutoLabelRules)
+    $ceOn = $Script:Cache.ContainsKey('ContentExplorer'); $ceCounts = @(if ($ceOn) { $Script:Cache['ContentExplorer'] })
+    $ceLocs = @(if ($Script:Cache.ContainsKey('ContentExplorerLocations')) { $Script:Cache['ContentExplorerLocations'] })
+    $actOn = $Script:Cache.ContainsKey('DlpAudit'); $ruleAct = @(if ($actOn) { Get-DlpRuleActivity })
+    $epAll = @(Get-EndpointRuleActions)
+    $customer = if ($Script:Settings.CustomerName) { $Script:Settings.CustomerName } else { $null }
 
     $pEnf = @($policies | Where-Object { $_.Mode -eq 'Enable' }).Count
     $pTest = @($policies | Where-Object { $_.Mode -like 'Test*' }).Count
@@ -1797,16 +2835,19 @@ function New-DlpWordReport {
     $respCount['Endpoint'] = @($ruleSum | Where-Object { $_.ResponseInterpretation -like 'Endpoint*' }).Count
 
     # ---------- cover ----------
-    Add-DocPara '' -After 2400
+    if ($Script:Settings.LogoPath -and (Test-Path $Script:Settings.LogoPath)) { Add-DocPara '' -After 1200; Add-DocImage -Path $Script:Settings.LogoPath -WidthCm 5 }
+    else { Add-DocPara '' -After 2400 }
     Add-DocXml "<w:p><w:pPr><w:pStyle w:val=`"Title`"/></w:pPr>$(New-DocRuns 'Microsoft Purview Data Loss Prevention Assessment')</w:p>"
-    Add-DocPara $org -Size 32 -Color '444444' -After 600
-    Add-DocTable -Headers @('Item', 'Detail') -Widths @(1, 3) -FontSize 19 -Rows @(
-        , @('Organisation', $org)
-        , @('Tenant ID', $tid)
-        , @('Data collected', $when)
-        , @('Collected by', $by)
-        , @('Method', 'Get-M365DlpConfiguration.ps1 (read-only discovery using Security & Compliance PowerShell)')
-    )
+    Add-DocPara $(if ($customer) { $customer } else { $org }) -Size 32 -Color '444444' -After 600
+    $coverRows = @()
+    if ($customer) { $coverRows += , @('Prepared for', $customer) }
+    if ($Script:Settings.AssessorName) { $coverRows += , @('Prepared by', $Script:Settings.AssessorName) }
+    $coverRows += , @('Organisation', $org)
+    $coverRows += , @('Tenant ID', $tid)
+    $coverRows += , @('Data collected', $when)
+    $coverRows += , @('Collected by', $by)
+    $coverRows += , @('Method', 'Get-M365DlpConfiguration.ps1 (read-only discovery using Security & Compliance and Exchange Online PowerShell)')
+    Add-DocTable -Headers @('Item', 'Detail') -Widths @(1, 3) -FontSize 19 -Rows $coverRows
     Add-DocCallout 'Confidential:' 'This report describes how sensitive information is protected in this tenant. Store and share it in line with the organisation''s data handling policy.' 'FFF4E5' 'E08A00'
     Add-DocToc
 
@@ -1822,7 +2863,9 @@ function New-DlpWordReport {
     Add-DocBullet '**Framework alignment** The NCSC, NIST and ISO 27001 references the area supports, what each expects, and the status in this tenant.'
     Add-DocBullet '**Learn more** Links to the relevant Microsoft Learn documentation.'
     Add-DocPara 'Section 21 gives step-by-step guidance for applying the configuration needed to close the gaps found.'
-    Add-DocPara 'Large tables are shortened in this report. The full data for every area is in the CSV, JSON and Excel files produced alongside this document (see Appendix C).'
+    Add-DocPara 'The executive summary scores the DLP programme on six dimensions (0 to 5). Section 4 includes a **coverage map** of data types against locations, section 6 shows **what actually happens** when someone shares sensitive data, section 15 lists **hygiene checks**, and section 20 is a **prioritised action plan** with effort and licence notes. Where collected, section 7 shows **where sensitive data is stored** (Content Explorer) and section 17 shows **how often each rule fires** (audit log).'
+    Add-DocPara 'Where an area has configuration worth reading in full, such as label policies, alert policies or Endpoint DLP settings, it is described in a **Configuration details** part of that section. Every DLP policy and rule is written out in plain English in **Appendix E**, so the report can be reviewed without opening the spreadsheets.'
+    Add-DocPara 'Very long lists are shortened. The complete raw data for every area is still in the CSV, JSON and Excel files produced alongside this document (see Appendix C).'
 
     # ---------- 2 Executive summary ----------
     Add-DocHeading '2. Executive summary' 1
@@ -1888,6 +2931,17 @@ function New-DlpWordReport {
     }
     Add-DocTable -Headers @('Location', 'What it covers', 'Enforced', 'Simulation', 'Status') -Widths @(1.3, 4, 1, 1, 1.4) -Rows @($rows) -Note 'Policies can cover several locations, so counts can add up to more than the number of policies. Detail: 12_DLP_Workload_Coverage.'
     $cons = @()
+    try {
+        $map = @(Get-CoverageMap -Coverage $cov -RuleSum $ruleSum -ClassRows $rc -EndpointActions $epAll)
+        Export-Dataset '84_Coverage_Map' $map -AlreadyFlat
+        Add-DocHeading 'Coverage map: what is protected, where' 3
+        Add-DocPara 'Each cell shows the strongest response that applies when that type of information is found in that location. Green means the action is stopped or needs an override; amber means it is allowed but the user is told, or only recorded; grey means no rule covers it.'
+        Add-DocTable -Headers (@('Location') + $Script:DataCategories) -Widths @(1.5, 1.1, 1.1, 1.2, 1.1, 1.2, 1) -FontSize 16 -Rows @(foreach ($m in $map) { , (@($m.Location) + @(foreach ($c in $Script:DataCategories) { Get-MapCellMarkup $m.$c })) }) -Note 'Categories are worked out from the names of the sensitive information types in each rule. Simulation = the policy is not enforced yet.'
+        $cons = @()
+        $unprotCats = @($Script:DataCategories | Where-Object { $c = $_; $c -notin 'Other', 'Labelled content' -and -not ($map | Where-Object { $_.$c -in 'Block', 'Override', 'Warn' }) })
+        if ($policies.Count -gt 0 -and $unprotCats.Count -gt 0) { $cons += "No location stops or challenges sharing of: **$($unprotCats -join ', ')**. Confirm whether these types of information exist in the organisation (section 7) and need protecting." }
+    }
+    catch { Add-ReportPartError 'Coverage map' $_ }
     $core = 'Exchange', 'SharePoint', 'OneDrive', 'Teams', 'Endpoint'
     $gaps = @($core | Where-Object { $covCount[$_] -eq 0 })
     if ($gaps.Count -gt 0 -and $policies.Count -gt 0) { $cons += Add-Obs 'Coverage' 'High' "No enforced policy covers: $($gaps -join ', '). Confirm whether these locations are in scope and, if so, extend existing policies or create new ones." }
@@ -1914,7 +2968,7 @@ function New-DlpWordReport {
             $resp = ([string]$r.ResponseInterpretation) -replace ' \(see EndpointDlpRestrictions\)', ''
             , @([string]$r.Policy, [string]$r.Rule, $resp, [string]$r.ReportSeverityLevel, $al, $(if ($r.Disabled -eq 'True') { 'Disabled' } else { 'Active' }))
         }
-        Add-DocTable -Headers @('Policy', 'Rule', 'Response', 'Severity', 'Alert', 'State') -Widths @(2.4, 2.6, 1.8, 1, 0.8, 1) -Rows @($rows) -MaxRows 60 -Note 'Full conditions, exceptions and actions: 14_DLP_Rules_Conditions_Actions.'
+        Add-DocTable -Headers @('Policy', 'Rule', 'Response', 'Severity', 'Alert', 'State') -Widths @(2.4, 2.6, 1.8, 1, 0.8, 1) -Rows @($rows) -MaxRows 60 -Note 'Appendix E describes what each rule looks for, its exceptions and what it does, in plain English.'
     }
     $cons = @()
     if ($respCount['Audit only'] -gt 0) { $cons += Add-Obs 'Rules' 'Medium' "$(Get-Plural $respCount['Audit only'] 'rule only audits' 'rules only audit'). That is right while tuning, but these rules do not protect information. Plan to add policy tips or blocking once false positives are understood." }
@@ -1949,6 +3003,28 @@ function New-DlpWordReport {
     if ($ovr.Count -gt 0) { $cons += Add-Obs 'User experience' 'Low' "$(Get-Plural $ovr.Count 'rule allows' 'rules allow') overrides. Agree who reviews override justifications and how often, otherwise overrides can become a silent bypass." }
     if ($tips.Count -eq 0 -and $rules.Count -gt 0) { $cons += Add-Obs 'User experience' 'Medium' 'No rules notify users. Users are not being told when they handle sensitive information inappropriately, which removes an important education opportunity.' }
     $Script:AreaStatus['UX'] = $(if ($rules.Count -eq 0 -or $tips.Count -eq 0) { 'R' } elseif ($customTip.Count -eq 0) { 'A' } else { 'G' })
+    try {
+        $scen = @()
+        foreach ($p in ($policies | Where-Object { $_.Mode -ne 'Disable' } | Sort-Object { [int]('0' + (Get-Val $_ 'Priority')) })) {
+            foreach ($r in @($rules | Where-Object { [string](Get-Val $_ 'ParentPolicyName') -eq [string]$p.Name -and (ConvertTo-CellValue (Get-Val $_ 'Disabled')) -ne 'True' } | Sort-Object { [int]('0' + (Get-Val $_ 'Priority')) })) {
+                $rs = $ruleSum | Where-Object { $_.Policy -eq [string]$p.Name -and $_.Rule -eq [string]$r.Name } | Select-Object -First 1
+                if (-not $rs) { continue }
+                $scen += [pscustomobject]@{ Policy = [string]$p.Name; Rule = [string]$r.Name; Text = (Get-ScenarioText -Rule $r -RuleSum $rs -Policy $p -ClassRows @($rc | Where-Object { $_.Policy -eq [string]$p.Name -and $_.Rule -eq [string]$r.Name }) -LabelNames $labelNames -EndpointActions $epAll) }
+            }
+        }
+        if ($scen.Count -gt 0) {
+            Add-DocHeading 'What actually happens: example scenarios' 3
+            Add-DocPara 'Each example below is worked out from a rule''s conditions and actions, to show the effect on a user in plain terms.'
+            foreach ($sc in ($scen | Select-Object -First 16)) {
+                Add-DocPara "**$($sc.Policy) - $($sc.Rule)**" -Size 19 -Color '1F3B57' -After 20
+                Add-DocPara $sc.Text -After 140
+            }
+            if ($scen.Count -gt 16) { Add-DocPara "Showing 16 of $($scen.Count) rules; Appendix E describes every rule." -Size 16 -Color '666666' -Italic }
+            $nothingStops = @($ruleSum | Where-Object { $_.ResponseInterpretation -match '^Block' }).Count -eq 0 -and $pEnf -gt 0
+            if ($nothingStops) { $cons += Add-Obs 'User experience' 'High' 'In every scenario the action **goes ahead**: no enforced rule blocks or asks for an override, so DLP currently records and warns but does not prevent data leaving the organisation.' }
+        }
+    }
+    catch { Add-ReportPartError 'Example scenarios' $_ }
     Add-SectionEnd $cons @('PolicyTips', 'DlpReference') -Area 'UX'
 
     # ---------- 7 SITs ----------
@@ -1967,7 +3043,37 @@ function New-DlpWordReport {
     if ($usedNames.Count -eq 0 -and $rules.Count -gt 0) { $cons += 'No sensitive information types are referenced in DLP rules; rules may rely only on labels or other conditions.' }
     $cons += 'Compare the types in use with the organisation''s data inventory. Common gaps include national identifiers, bank account and payment details, internal customer or account references and staff identifiers.'
     $Script:AreaStatus['SIT'] = $(if ($usedNames.Count -gt 0) { 'G' } else { 'A' })
-    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions') -Area 'SIT'
+    try {
+        Add-DocHeading 'Where this information is stored (Content Explorer)' 3
+        if (-not $ceOn) { Add-DocPara 'Content Explorer counts were not collected in this run. Enable Content Explorer in the complete report (it needs the **Content Explorer List Viewer** role) to show how many emails, files and messages contain each type of sensitive information.' }
+        else {
+            Add-SectionGap 'Content Explorer item counts'
+            Add-DocPara 'Content Explorer counts the items that contain each sensitive information type or label, by location. These are items already stored in Microsoft 365, whether or not a DLP rule looks for them.'
+            $ceRows = foreach ($g in ($ceCounts | Where-Object TagType -eq 'SensitiveInformationType' | Group-Object TagName)) {
+                $tot = [int64](($g.Group | Measure-Object ItemCount -Sum).Sum)
+                $cells = @(foreach ($w in $Script:CeWorkloads.Keys) { $x = $g.Group | Where-Object Workload -eq $w | Select-Object -First 1; if ($x -and $null -ne $x.ItemCount) { '{0:N0}' -f $x.ItemCount } else { 'n/a' } })
+                $used = [bool]($g.Group[0].UsedInDlpRules)
+                [pscustomobject]@{ Total = $tot; Row = (@([string]$g.Name) + $cells + @(('{0:N0}' -f $tot), $(if ($used) { '[[G]]Yes' } elseif ($tot -gt 0) { '[[R]]No' } else { '[[N]]No' }))) }
+            }
+            $ceRows = @($ceRows | Sort-Object Total -Descending)
+            if ($ceRows.Count) { Add-DocTable -Headers @('Sensitive information type', 'Email', 'SharePoint', 'OneDrive', 'Teams', 'Total', 'In a DLP rule') -Widths @(3, 1, 1.1, 1.1, 0.9, 1, 1.1) -FontSize 16 -Rows @(foreach ($x in $ceRows) { , $x.Row }) -Note 'Detail: 62_Content_Explorer_Counts. n/a = the count could not be retrieved for that location.' }
+            $labRows = foreach ($g in ($ceCounts | Where-Object TagType -eq 'Sensitivity' | Group-Object TagName)) {
+                $tot = [int64](($g.Group | Measure-Object ItemCount -Sum).Sum)
+                , (@([string]$g.Name) + @(foreach ($w in $Script:CeWorkloads.Keys) { $x = $g.Group | Where-Object Workload -eq $w | Select-Object -First 1; if ($x -and $null -ne $x.ItemCount) { '{0:N0}' -f $x.ItemCount } else { 'n/a' } }) + @(('{0:N0}' -f $tot)))
+            }
+            if (@($labRows).Count) { Add-DocPara 'Items carrying each sensitivity label:'; Add-DocTable -Headers @('Sensitivity label', 'Email', 'SharePoint', 'OneDrive', 'Teams', 'Total') -Widths @(3, 1, 1.1, 1.1, 0.9, 1) -FontSize 16 -Rows @($labRows) }
+            if ($ceLocs.Count) {
+                Add-DocPara 'Where the largest concentrations are (sample of up to 500 items per type and location):'
+                Add-DocTable -Headers @('Sensitive information type', 'Location', 'Site or mailbox', 'Items in sample') -Widths @(2.4, 1.1, 4, 1) -FontSize 16 -Rows @(foreach ($l in $ceLocs) { , @([string]$l.TagName, [string]$l.Workload, [string]$l.Location, "$($l.ItemsInSample) of $($l.SampleSize)") }) -MaxRows 30 -Note 'Detail: 63_Content_Explorer_Top_Locations.'
+            }
+            $gapsCe = @($ceCounts | Where-Object { $_.TagType -eq 'SensitiveInformationType' -and -not $_.UsedInDlpRules -and $_.ItemCount -gt 0 } | Group-Object TagName)
+            if ($gapsCe.Count) { $cons += Add-Obs 'Data discovery' 'High' "Sensitive information is stored in Microsoft 365 that no DLP rule looks for: $(@($gapsCe | ForEach-Object { '{0} ({1:N0} items)' -f $_.Name, ($_.Group | Measure-Object ItemCount -Sum).Sum }) -join '; '). Decide whether it needs protecting." }
+            $big = @($ceCounts | Where-Object { $_.TagType -eq 'SensitiveInformationType' -and $_.UsedInDlpRules -and $_.ItemCount -gt 0 } | Group-Object TagName | Where-Object { ($_.Group | Measure-Object ItemCount -Sum).Sum -ge 1000 })
+            if ($big.Count) { $cons += "Large volumes of protected information are stored ($(@($big | ForEach-Object Name) -join ', ')). Check the rules for these types are strong enough for the amount of data involved." }
+        }
+    }
+    catch { Add-ReportPartError 'Content Explorer' $_ }
+    Add-SectionEnd $cons @('SitOverview', 'SitDefinitions', 'ContentExplorer') -Area 'SIT'
 
     # ---------- 8 Custom SITs ----------
     Add-DocHeading '8. Custom sensitive information types and keyword dictionaries' 1
@@ -1977,8 +3083,17 @@ function New-DlpWordReport {
     else {
         $rows = foreach ($s in $custom) { , @([string]$s.Name, [string]$s.Publisher, [string]$s.RecommendedConfidence, $(if ($s.UsedInDlpRules) { 'Yes' } else { 'No' })) }
         Add-DocTable -Headers @('Custom SIT', 'Publisher', 'Recommended confidence', 'Used in DLP') -Widths @(3.5, 2, 1.5, 1) -Rows @($rows) -MaxRows 40 -Note 'Definitions of custom rule packages are saved as 22_RulePackage_*.xml.'
+        $described = @($custom | Where-Object { $_.Description })
+        if ($described.Count -gt 0) {
+            Add-DocHeading 'Configuration details: what each custom SIT detects' 3
+            Add-DocTable -Headers @('Custom SIT', 'Description (as entered by the author)') -Widths @(2.5, 5.5) -Rows @(foreach ($s in $described) { , @([string]$s.Name, [string]$s.Description) }) -MaxRows 40
+        }
     }
     Add-DocPara "$(Get-Plural $dicts.Count 'keyword dictionary is' 'keyword dictionaries are') configured."
+    if ($dicts.Count -gt 0) {
+        Add-DocHeading 'Configuration details: keyword dictionaries' 3
+        Add-DocTable -Headers @('Dictionary', 'Description', 'Keywords') -Widths @(2.5, 4.5, 1) -Rows @(Get-DictionaryRows $dicts) -MaxRows 30 -Note 'The keyword lists themselves are not reproduced here; review them in the Purview portal.'
+    }
     $cons = @()
     $unused = @($custom | Where-Object { -not $_.UsedInDlpRules })
     if ($unused.Count -gt 0) { $cons += Add-Obs 'Custom SITs' 'Low' "$(Get-Plural $unused.Count 'custom SIT is' 'custom SITs are') not used by any DLP rule: either a policy is missing or the SIT is obsolete." }
@@ -1992,6 +3107,11 @@ function New-DlpWordReport {
     Add-SectionGap 'Exact Data Match schemas'
     $edmRefs = @($classRefs | Where-Object { $_.ClassifierType -match 'ExactMatch|EDM' })
     Add-DocPara "$(Get-Plural $edm.Count 'EDM schema is' 'EDM schemas are') configured, with $(Get-Plural $edmSits.Count 'EDM-based SIT' 'EDM-based SITs'). EDM classifiers are referenced $(Get-Plural $edmRefs.Count 'time' 'times') in DLP rules."
+    if ($edm.Count -gt 0) {
+        Add-DocHeading 'Configuration details: EDM schemas' 3
+        Add-DocPara 'Each schema describes the columns of the uploaded dataset. **Searchable** columns are the ones Purview looks for in content; the others are used to confirm a match.'
+        Add-DocTable -Headers @('Schema', 'Columns') -Widths @(2, 6) -Rows @(Get-EdmSchemaRows $edm) -MaxRows 20
+    }
     if ($edmSits.Count -gt 0) { Add-DocTable -Headers @('EDM sensitive information type', 'Used in DLP') -Widths @(5, 1) -Rows @(foreach ($s in $edmSits) { , @([string]$s.Name, $(if ($s.UsedInDlpRules) { 'Yes' } else { 'No' })) }) }
     $cons = @()
     if ($edm.Count -eq 0) { $cons += 'EDM is not in use. Consider it for well-defined structured datasets such as customer or employee records, where accuracy matters most. Agree data ownership and refresh frequency first.' }
@@ -2039,6 +3159,16 @@ function New-DlpWordReport {
         Add-DocTable -Headers @('Label (in priority order)', 'Applies to', 'Encrypts', 'Used in DLP') -Widths @(3, 3, 1, 1) -Rows @($rows) -MaxRows 50 -Note 'Sublabels are indented. Detail: 30_Sensitivity_Labels.'
     }
     Add-DocPara "$(Get-Plural $labelPol.Count 'label policy publishes' 'label policies publish') labels to users. $(Get-Plural $autoPol.Count 'auto-labelling policy is' 'auto-labelling policies are') configured. Labels are used as conditions in DLP rules $(Get-Plural $labelRefs.Count 'time' 'times')."
+    if ($labelPol.Count -gt 0) {
+        Add-DocHeading 'Configuration details: label policies' 3
+        Add-DocPara 'Which labels each policy makes available, who receives them, and the main settings that change the user experience.'
+        Add-DocTable -Headers @('Label policy', 'Labels published', 'Published to', 'Key settings') -Widths @(1.8, 2.6, 1.8, 2.6) -FontSize 16 -Rows @(Get-LabelPolicyRows $labelPol $labelNames) -MaxRows 25 -Note 'Advanced settings are in 31_Sensitivity_Label_Policies.'
+    }
+    if ($autoPol.Count -gt 0) {
+        Add-DocHeading 'Configuration details: auto-labelling policies' 3
+        Add-DocPara 'Which label each policy applies automatically, where, and what content it looks for.'
+        Add-DocTable -Headers @('Auto-labelling policy', 'Applies label', 'Status', 'Where', 'Looks for') -Widths @(1.8, 1.3, 1.3, 2, 2.4) -FontSize 16 -Rows @(Get-AutoLabelRows $autoPol $autoRules $labelNames) -MaxRows 25
+    }
     $cons = @()
     if ($labels.Count -eq 0) { $cons += Add-Obs 'Sensitivity labels' 'High' 'No sensitivity labels exist. Labels are a foundation for information protection; consider a simple taxonomy (four or five labels) before relying on label-based DLP.' }
     elseif ($labelRefs.Count -eq 0) { $cons += Add-Obs 'Sensitivity labels' 'Medium' 'Sensitivity labels exist but are not used in any DLP rule. Using them as conditions (for example blocking external sharing of Highly Confidential content) is a simple, explainable control.' }
@@ -2062,10 +3192,22 @@ function New-DlpWordReport {
         , @('Browser and cloud uploads', [string]$upl.Count, ((@($upl.Value | Sort-Object -Unique)) -join ', '))
         , @('Other (clipboard, network share, Bluetooth, apps)', [string]$oth.Count, ((@($oth.Value | Sort-Object -Unique)) -join ', '))
     ) -Note 'Detail: 16_Endpoint_DLP_Rule_Restrictions.'
-    $setRows = @($epSet | Where-Object { $_.Value } | ForEach-Object { , @([string]$_.Area, [string]$_.Setting, [string]$_.Value) })
+    $epDetail = @($epRules | Group-Object { "$($_.Policy)|$($_.Rule)" } | ForEach-Object {
+            $pr = $_.Name -split '\|', 2
+            $acts = @($_.Group | ForEach-Object {
+                    $nm = if ($Script:EndpointActionNames.ContainsKey([string]$_.Setting)) { $Script:EndpointActionNames[[string]$_.Setting] } else { ConvertFrom-CamelCase ([string]$_.Setting) }
+                    "$($nm): **$(([string]$_.Value).ToLower())**" })
+            , @($pr[0], $pr[1], ($acts -join '; '))
+        })
+    if ($epDetail.Count -gt 0) {
+        Add-DocHeading 'Configuration details: device restrictions by rule' 3
+        Add-DocTable -Headers @('Policy', 'Rule', 'What happens on the device') -Widths @(2, 2, 4.5) -FontSize 16 -Rows $epDetail -MaxRows 30
+    }
+    $setRows = @(Get-EndpointSettingRows $epSet)
     if ($setRows.Count -gt 0) {
-        Add-DocHeading 'Tenant-wide Endpoint DLP settings' 3
-        Add-DocTable -Headers @('Area', 'Setting', 'Value') -Widths @(2.5, 2.5, 4) -Rows $setRows -MaxRows 40 -Note 'Detail: 41_Endpoint_DLP_Settings.'
+        Add-DocHeading 'Configuration details: tenant-wide Endpoint DLP settings' 3
+        Add-DocPara 'These settings apply to every device policy: which browsers, apps, websites, printers and USB devices are allowed or restricted, and which file paths are excluded from monitoring.'
+        Add-DocTable -Headers @('Area', 'Setting', 'Value') -Widths @(1.8, 2.4, 4.3) -FontSize 16 -Rows $setRows -MaxRows 40 -Note 'Detail: 41_Endpoint_DLP_Settings.'
     }
     Add-DocCallout 'Note:' 'Device onboarding status is not available through PowerShell. Check onboarded devices in the Purview portal (Settings > Device onboarding) or in Microsoft Defender.'
     $cons = @()
@@ -2099,6 +3241,17 @@ function New-DlpWordReport {
         , @('Simulation without policy tips', [string]@($policies | Where-Object { $_.Mode -eq 'TestWithoutNotifications' }).Count)
         , @('Disabled', [string]$pOff)
     )
+    $hyg = @()
+    try {
+        $hyg = @(Get-HygieneChecks -Policies $policies -PolSum $polSum -Rules $rules -RuleSum $ruleSum -ClassRows $rc -Coverage $cov -SitView $sitView -Labels $labels -LabelPolicies $labelPol -AlertPolicies $alertPol -CeCounts $ceCounts -Activity $ruleAct -ActivityCollected $actOn)
+        Export-Dataset '82_Hygiene_Checks' $hyg -AlreadyFlat
+        Add-DocHeading 'Configuration hygiene checks' 3
+        Add-DocPara 'Automatic checks for common configuration problems. Green = no issue found, amber = worth reviewing, red = likely gap, grey = not checked.'
+        $statusWord = @{ G = 'OK'; A = 'Review'; R = 'Issue'; N = 'Not checked' }
+        Add-DocTable -Headers @('Check', 'Result', 'Detail') -Widths @(2.2, 0.9, 5.4) -FontSize 16 -Rows @(foreach ($h in $hyg) { , @([string]$h.Check, "[[$($h.Status)]]$($statusWord[[string]$h.Status])", $(if ($h.Advice) { "$($h.Detail) **Suggested:** $($h.Advice)" } else { [string]$h.Detail })) })
+        foreach ($h in @($hyg | Where-Object { $_.Status -eq 'R' -and $_.Check -notin 'Stored sensitive data is covered by a rule', 'Rules are not routinely overridden' })) { [void](Add-Obs 'Hygiene' 'Medium' "$($h.Check): $($h.Detail) $($h.Advice)") }
+    }
+    catch { Add-ReportPartError 'Hygiene checks' $_ }
     $cons = @('Agree policy waves, pilot groups, acceptance criteria (for example an acceptable false-positive rate) and enforcement dates for each policy.')
     $Script:AreaStatus['Simulation'] = $(if ($pEnf -gt 0) { 'G' } elseif ($policies.Count -gt 0) { 'A' } else { 'R' })
     Add-SectionEnd $cons @('DlpSimulation', 'DlpSimStart', 'DlpDeploy') -Area 'Simulation'
@@ -2112,6 +3265,11 @@ function New-DlpWordReport {
     if ($ruleAlert.Count -gt 0) {
         Add-DocTable -Headers @('Policy', 'Rule', 'Severity', 'Alert / report recipients') -Widths @(2.5, 2.5, 1, 3) -Rows @(foreach ($r in $ruleAlert) { , @([string]$r.Policy, [string]$r.Rule, [string]$r.ReportSeverityLevel, ((@([string]$r.GenerateAlert, [string]$r.GenerateIncidentReport) | Where-Object { $_ } | Select-Object -Unique) -join ' | ')) }) -MaxRows 40
     }
+    if ($alertPol.Count -gt 0) {
+        Add-DocHeading 'Configuration details: DLP alert policies' 3
+        Add-DocPara 'Alert policies decide when a DLP alert is raised and who is emailed about it.'
+        Add-DocTable -Headers @('Alert policy', 'Severity', 'State', 'Raised when', 'Email recipients') -Widths @(2.6, 0.9, 0.7, 1.8, 2.5) -FontSize 16 -Rows @(Get-AlertPolicyRows $alertPol) -MaxRows 30
+    }
     $cons = @()
     if ($ruleAlert.Count -eq 0 -and $rules.Count -gt 0) { $cons += Add-Obs 'Alerts' 'High' 'No DLP rules raise alerts, so nobody is notified of policy matches.' }
     $siteOnly = @($ruleAlert | Where-Object { ([string]$_.GenerateAlert + [string]$_.GenerateIncidentReport) -match '^(SiteAdmin\s*\|?\s*)+$' })
@@ -2121,7 +3279,7 @@ function New-DlpWordReport {
     Add-SectionEnd $cons @('Alerts') -Area 'Alerts'
 
     # ---------- 17 Activity Explorer ----------
-    Add-DocHeading '17. Activity Explorer' 1
+    Add-DocHeading '17. Activity Explorer and DLP rule activity' 1
     Add-SectionIntro -What '**Activity Explorer** shows how sensitive and labelled information is being used: DLP rule matches, labels applied or changed, files copied to USB, printed, uploaded and more. It is the main source of evidence for policy tuning and investigations.' -Why 'Real activity data shows whether policies are working, where false positives occur, and which workloads and users generate the most risk.'
     $act = @(if ($Script:Cache.ContainsKey('Activity')) { $Script:Cache['Activity'] } else { @() })
     if (-not $Script:Cache.ContainsKey('Activity')) { Add-DocPara 'Activity Explorer data was not included in this run. Re-run the complete report with Activity Explorer enabled to add this section.' }
@@ -2131,8 +3289,32 @@ function New-DlpWordReport {
         $grp = @($act | Group-Object { '{0}|{1}' -f (Get-Val $_ 'Activity'), (Get-Val $_ 'Workload') } | Sort-Object Count -Descending)
         if ($grp.Count) { Add-DocTable -Headers @('Activity', 'Workload', 'Count') -Widths @(4, 2.5, 1) -Rows @(foreach ($g in $grp) { $p = $g.Name -split '\|', 2; , @($p[0], $p[1], [string]$g.Count) }) -MaxRows 25 -Note 'Detail: 60_Activity_Explorer_Records (contains user and file names).' }
     }
-    $Script:AreaStatus['Activity'] = $(if ($Script:Cache.ContainsKey('Activity')) { 'G' } else { 'N' })
-    Add-SectionEnd @('Agree a regular review of Activity Explorer (for example weekly during rollout, then monthly) and the operational reports stakeholders need.') @('ActivityExplorer') -Area 'Activity'
+    $actCons = @()
+    try {
+        Add-DocHeading "DLP rule activity (audit log, last $($Script:Settings.AuditDays) days)" 3
+        $actCons = @()
+        if (-not $actOn) { Add-DocPara 'DLP rule activity was not collected in this run. Enable it in the complete report to show how often each rule matches, how often users override it and how often matches are reported as false positives. It reads the unified audit log through Exchange Online PowerShell (role: **View-Only Audit Logs** or **Audit Logs**).' }
+        else {
+            Add-SectionGap "DLP rule activity from the audit log ($($Script:Settings.AuditDays) days)"
+            $tot = ($ruleAct | Measure-Object Matches -Sum).Sum; $ov = ($ruleAct | Measure-Object Overrides -Sum).Sum; $fpx = ($ruleAct | Measure-Object FalsePositives -Sum).Sum
+            Add-DocPara "The audit log recorded **$('{0:N0}' -f [int64]$tot)** DLP rule matches in the period, with **$ov** overrides and **$fpx** false-positive reports."
+            $rowsAct = foreach ($r in $ruleSum) {
+                $a = $ruleAct | Where-Object { $_.Policy -eq $r.Policy -and $_.Rule -eq $r.Rule } | Select-Object -First 1
+                if ($a) { , @([string]$r.Policy, [string]$r.Rule, ('{0:N0}' -f $a.Matches), [string]$a.Overrides, [string]$a.FalsePositives, [string]$a.DistinctUsers, [string]$a.Workloads, [string]$a.LastMatch) }
+                else { , @([string]$r.Policy, [string]$r.Rule, '[[A]]0', '0', '0', '0', '', '') }
+            }
+            Add-DocTable -Headers @('Policy', 'Rule', 'Matches', 'Overrides', 'False positives', 'Users', 'Where', 'Last match') -Widths @(1.8, 2.2, 0.8, 0.8, 0.8, 0.7, 1.3, 1.1) -FontSize 15 -Rows @($rowsAct) -MaxRows 40 -Note 'User names are not shown here. Detail: 65_DLP_Rule_Activity_Summary; individual events (with users) in 64_DLP_Audit_Rule_Matches.'
+            $silentN = @($rowsAct | Where-Object { $_[2] -eq '[[A]]0' }).Count
+            if ($silentN) { $actCons += "$(Get-Plural $silentN 'rule had' 'rules had') no matches in the period. Test them with sample data to confirm they still detect what they should." }
+            $heavyAct = @($ruleAct | Where-Object { $_.Matches -ge 10 -and ($_.Overrides + $_.FalsePositives) / [double]$_.Matches -ge 0.3 })
+            if ($heavyAct.Count) { $actCons += Add-Obs 'Rule activity' 'Medium' "$(Get-Plural $heavyAct.Count 'rule is' 'rules are') overridden or reported as a false positive in 30% or more of matches ($(@($heavyAct | ForEach-Object Rule) -join '; ')). Review the justifications and tune the rule." }
+            $other = @(Get-DlpAuditRecords | Where-Object { $_.Policy -and -not ($ruleSum | Where-Object Policy -eq $_.Policy) } | Select-Object -ExpandProperty Policy -Unique)
+            if ($other.Count) { $actCons += "Matches were also recorded for policies that no longer exist or were not collected: $($other -join ', ')." }
+        }
+    }
+    catch { Add-ReportPartError 'DLP rule activity' $_ }
+    $Script:AreaStatus['Activity'] = $(if ($Script:Cache.ContainsKey('Activity') -or $actOn) { 'G' } else { 'N' })
+    Add-SectionEnd (@($actCons) + @('Agree a regular review of Activity Explorer and rule activity (for example weekly during rollout, then monthly) and the operational reports stakeholders need.')) @('ActivityExplorer', 'AuditSearch') -Area 'Activity'
 
     # ---------- 18 Exchange ----------
     $cons = @()
@@ -2145,6 +3327,11 @@ function New-DlpWordReport {
         Add-DocPara "$(Get-Plural $tr.Count 'mail flow rule is' 'mail flow rules are') configured; $(Get-Plural $trSit.Count 'inspects' 'inspect') sensitive information types."
         $aud = @($Script:Cache['Audit'])
         if ($aud.Count) { Add-DocPara ("Unified audit log ingestion: **{0}**." -f $(if ($aud[0].UnifiedAuditLogIngestionEnabled) { 'Enabled' } else { 'Disabled' })) }
+        if ($tr.Count -gt 0) {
+            Add-DocHeading 'Configuration details: mail flow rules' 3
+            Add-DocPara 'Rules are listed in priority order. The description is the summary Exchange Online generates for each rule.'
+            Add-DocTable -Headers @('Mail flow rule', 'State', 'Inspects SITs', 'What it does') -Widths @(2, 1.3, 0.9, 4.3) -FontSize 16 -Rows @(Get-TransportRuleRows $tr) -MaxRows 40 -Note 'Detail: 70_Exchange_Transport_Rules.'
+        }
         $cons = @()
         if ($trSit.Count -gt 0) { $cons += Add-Obs 'Exchange' 'Medium' "$(Get-Plural $trSit.Count 'mail flow rule inspects' 'mail flow rules inspect') sensitive information. Consider migrating this logic to Purview DLP so all data protection is managed in one place." }
         if ($aud.Count -and -not $aud[0].UnifiedAuditLogIngestionEnabled) { $cons += Add-Obs 'Auditing' 'High' 'The unified audit log is disabled. DLP reporting, Activity Explorer and investigations depend on it.' }
@@ -2169,8 +3356,27 @@ function New-DlpWordReport {
 
     # ---------- 20 Next steps ----------
     Add-DocHeading '20. Recommended next steps' 1
-    Add-DocPara 'The table below lists suggested activities for each DLP topic, with the automated finding from this assessment. Use it as the starting point for the engagement plan; the same content, with Status, Owner and Target date columns, is in 00_Assessment_Summary.csv.'
-    if ($summaryRows.Count) { Add-DocTable -Headers @('Topic', 'Finding', 'Suggested activity') -Widths @(2, 3.5, 3) -FontSize 16 -Rows @(foreach ($s in $summaryRows) { , @([string]$s.Topic, [string]$s.Finding, [string]$s.SuggestedActivity) }) }
+    $licShort = @{}
+    try {
+        Add-DocHeading 'Prioritised action plan' 2
+        Export-ActionPlan
+        $plan = @($Script:Cache['ActionPlan'])
+        $licShort = @{}
+        foreach ($k in $Script:LicenceText.Keys) { $licShort[$Script:LicenceText[$k]] = $(switch ($k) { 'Core' { 'E3 / Business Premium' } 'None' { 'None' } 'Labels' { 'E3; auto-labelling E5*' } 'Alerts' { 'E3; volume alerts E5*' } 'Teams' { 'E5*' } 'Copilot' { 'E5* + Copilot' } default { 'E5*' } }) }
+        if ($plan.Count -eq 0) { Add-DocPara 'No actions were generated automatically. Use the topic table below to plan the engagement.' }
+        else {
+            Add-DocPara 'Actions generated from the observations in this report, highest priority first. **Effort** is a rough guide: Small = days, Medium = one to three weeks, Large = one to three months including testing and communication. **Licence** shows what the organisation needs for the action. The same list, with Owner, Target date and Status columns, is in **80_Action_Plan** (CSV and Excel) for tracking.'
+            $prioCell = @{ High = '[[R]]High'; Medium = '[[A]]Medium'; Low = '[[N]]Low'; Info = '[[N]]Info' }
+            Add-DocTable -Headers @('#', 'Priority', 'Action', 'Effort', 'Licence') -Widths @(0.4, 0.9, 5.2, 0.8, 1.3) -FontSize 16 -Rows @(foreach ($a in $plan) { , @([string]$a.Id, $prioCell[[string]$a.Priority], [string]$a.Action, [string]$a.Effort, $(if ($licShort.ContainsKey([string]$a.Licence)) { $licShort[[string]$a.Licence] } else { [string]$a.Licence })) }) -MaxRows 40 -Note 'E5* = Microsoft 365 E5, E5 Information Protection & Governance, or Microsoft Purview Suite (formerly E5 Compliance).'
+        }
+    }
+    catch { Add-ReportPartError 'Action plan' $_ }
+    Add-DocHeading 'Licensing notes' 2
+    Add-DocPara 'Core DLP for Exchange, SharePoint and OneDrive, and manual sensitivity labelling, are included in Microsoft 365 E3 and Business Premium. DLP for Teams chat, Endpoint DLP, DLP for Microsoft 365 Copilot, automatic labelling, Exact Data Match, trainable classifiers, Activity Explorer and Content Explorer need Microsoft 365 E5, the E5 Information Protection & Governance add-on, or the Microsoft Purview Suite (formerly E5 Compliance). Licensing changes over time: confirm against Microsoft''s current guidance and the organisation''s agreement before planning purchases.'
+    $l = $Script:LearnLinks['Licensing']; Add-DocLink -Title $l.Title -Url $l.Url -AsBullet
+    Add-DocHeading 'Activities by topic' 2
+    Add-DocPara 'Suggested activities for each DLP topic, with the automated finding from this assessment and the licence it needs. The same content, with Status, Owner and Target date columns, is in 00_Assessment_Summary.csv.'
+    if ($summaryRows.Count) { Add-DocTable -Headers @('Topic', 'Finding', 'Suggested activity', 'Licence') -Widths @(1.7, 3.2, 2.6, 1.3) -FontSize 15 -Rows @(foreach ($s in $summaryRows) { , @([string]$s.Topic, [string]$s.Finding, [string]$s.SuggestedActivity, $(if ($licShort.ContainsKey([string]$s.LicenceNeeded)) { $licShort[[string]$s.LicenceNeeded] } else { [string]$s.LicenceNeeded })) }) }
 
     # ---------- 21 Applying the configuration ----------
     $auditOff = [bool]($Script:Cache.ContainsKey('Audit') -and @($Script:Cache['Audit']).Count -and -not @($Script:Cache['Audit'])[0].UnifiedAuditLogIngestionEnabled)
@@ -2234,14 +3440,54 @@ function New-DlpWordReport {
         , @('16 / 41_Endpoint_DLP...', 'Device restrictions and Endpoint DLP settings')
         , @('50-52_Alert...', 'Alert policies and rule alerting')
         , @('53-55_Purview_Role...', 'Role groups and members')
+        , @('62 / 63_Content_Explorer...', 'Items containing each sensitive information type and label, and top locations')
+        , @('64 / 65_DLP_Audit... / Rule_Activity...', 'DLP rule matches, overrides and false positives from the audit log (64 contains user names)')
+        , @('80_Action_Plan', 'Prioritised action plan with effort, licence, owner and target date columns')
+        , @('81-84', 'Maturity scores, hygiene checks, changes since the last report and the coverage map')
         , @('99_Collection_Errors', 'Steps skipped or failed')
     )
 
     Add-FrameworkAppendix
 
+    Add-PolicyDetailAppendix -Policies $policies -Rules $rules -ClassRows $rc -LabelNames $labelNames
+
     # ---------- insert executive observations ----------
     $obsXml = [System.Text.StringBuilder]::new()
     $saved = $Script:Doc.Body; $Script:Doc.Body = $obsXml
+    try {
+        $auditOn = $false
+        if ($Script:Cache.ContainsKey('Audit') -and @($Script:Cache['Audit']).Count) { $auditOn = [bool]@($Script:Cache['Audit'])[0].UnifiedAuditLogIngestionEnabled }
+        $mat = @(Get-MaturityScores -Policies $policies -RuleSum $ruleSum -ClassRows $rc -CovCount $covCount -SitView $sitView -Edm $edm -Labels $labels -LabelPolicies $labelPol -AutoPolicies $autoPol -AlertPolicies $alertPol -RoleMembers $roleMembers -Hygiene $hyg -AuditOn $auditOn -EvidenceCollected ($actOn -or $ceOn))
+        $overall = [Math]::Round((($mat | Measure-Object Score -Average).Average), 1)
+        Export-Dataset '81_Maturity_Score' (@($mat) + @([pscustomobject][ordered]@{ Dimension = 'Overall'; Score = $overall; Evidence = (Get-MaturityLevel $overall); NextStep = '' })) -AlreadyFlat
+        Add-DocHeading 'DLP maturity' 2
+        Add-DocPara "Overall score: **$overall out of 5 ($(Get-MaturityLevel $overall))**. Each dimension is scored from 0 (not in place) to 5 (optimised) using the collected configuration. Use the scores to track progress between assessments rather than as an absolute grade."
+        $prevMat = @(); if ($Script:CompareFolder) { $prevMat = @(Read-RunFile $Script:CompareFolder '81_Maturity_Score') }
+        $matRows = foreach ($m in $mat) {
+            $cell = if ($m.Score -ge 4) { '[[G]]' } elseif ($m.Score -ge 2) { '[[A]]' } else { '[[R]]' }
+            $pm = $prevMat | Where-Object Dimension -eq $m.Dimension | Select-Object -First 1
+            $delta = if ($pm) { $d = [int]$m.Score - [int]$pm.Score; if ($d -gt 0) { " (+$d)" } elseif ($d -lt 0) { " ($d)" } else { ' (=)' } } else { '' }
+            , @([string]$m.Dimension, "$cell$($m.Score) / 5$delta", [string]$m.Evidence, [string]$m.NextStep)
+        }
+        Add-DocTable -Headers @('Dimension', 'Score', 'Based on', 'To improve') -Widths @(1.5, 1.3, 3.4, 2.6) -FontSize 16 -Rows @($matRows) -Note $(if ($prevMat.Count) { 'Brackets show the change since the previous assessment.' } else { '' })
+        if ($Script:CompareFolder) {
+            $prevInfo = @(Read-RunFile $Script:CompareFolder '01_Tenant_Info')
+            $prevWhen = if ($prevInfo.Count -and $prevInfo[0].CollectedAtUtc) { try { ([datetime]$prevInfo[0].CollectedAtUtc).ToString('dd MMMM yyyy') } catch { [string]$prevInfo[0].CollectedAtUtc } } else { Split-Path $Script:CompareFolder -Leaf }
+            Add-DocHeading "Changes since the last assessment ($prevWhen)" 2
+            if ($prevInfo.Count -and $tid -and $prevInfo[0].TenantId -and $prevInfo[0].TenantId -ne $tid) { Add-DocCallout 'Different tenant:' 'The previous report is for a different tenant, so no comparison was made.' 'FFF4E5' 'E08A00' }
+            else {
+                $changes = @(Get-ChangesSinceLastRun -Folder $Script:CompareFolder -Policies $policies -Rules $rules -Labels $labels -LabelPolicies $labelPol -AlertPolicies $alertPol)
+                Export-Dataset '83_Changes_Since_Last_Run' $changes -AlreadyFlat
+                if ($changes.Count -eq 0) { Add-DocPara 'No changes were found to DLP policies, rules, sensitivity labels, label policies or DLP alert policies.' }
+                else {
+                    $pm0 = $prevMat | Where-Object Dimension -eq 'Overall' | Select-Object -First 1
+                    if ($pm0) { Add-DocPara "Overall maturity has moved from **$($pm0.Score)** to **$overall**." }
+                    Add-DocTable -Headers @('Item', 'Name', 'Change') -Widths @(1.5, 4, 3) -FontSize 16 -Rows @(foreach ($c in $changes) { , @([string]$c.Item, [string]$c.Name, $(switch -Regex ([string]$c.Change) { '^Added' { '[[G]]Added' } '^Removed' { '[[R]]Removed' } default { [string]$c.Change } })) }) -MaxRows 40 -Note "Compared with: $(Split-Path $Script:CompareFolder -Leaf). Detail: 83_Changes_Since_Last_Run."
+                }
+            }
+        }
+    }
+    catch { Add-ReportPartError 'Maturity and changes' $_ }
     Add-DocHeading 'Key observations' 2
     $order = @{ 'High' = 0; 'Medium' = 1; 'Low' = 2; 'Info' = 3 }
     $obs = @($Script:ReportObs | Sort-Object { $order[$_.Severity] })
@@ -2306,8 +3552,9 @@ function Export-AssessmentSummary {
     $actDays = $Script:Settings.ActivityDays
 
     function New-Row { param($Category, $Topic, $Finding, $Evidence, $Activity, $Learn)
+        $lk = if ($Script:TopicLicence.ContainsKey($Topic)) { $Script:TopicLicence[$Topic] } else { 'Core' }
         [pscustomobject][ordered]@{ Category = $Category; Topic = $Topic; Finding = $Finding; EvidenceFile = $Evidence; SuggestedActivity = $Activity
-            Status = 'Not Started'; Owner = ''; TargetDate = ''; Notes = ''; LearnMore = "https://learn.microsoft.com/en-us/purview/$Learn" } }
+            LicenceNeeded = $Script:LicenceText[$lk]; Status = 'Not Started'; Owner = ''; TargetDate = ''; Notes = ''; LearnMore = "https://learn.microsoft.com/en-us/purview/$Learn" } }
 
     $rows = @(
         New-Row 'Fundamentals' 'Microsoft Purview Data Loss Prevention' ("$pTotal DLP policies: $pEnforce enforced, $pTest in test/simulation, $pOff disabled. $($rules.Count) rules." + (Get-StepGap 'DLP compliance policies', 'DLP compliance rules')) '11_DLP_Policies_Summary' 'Confirm which types of information are considered sensitive.' 'dlp-learn-about-dlp'
@@ -2331,6 +3578,8 @@ function Export-AssessmentSummary {
         New-Row 'User experience' 'Block with Override' "$override rules block with override." '14_DLP_Rules_Conditions_Actions' 'Define which policies permit overrides and who reviews the justifications.' 'dlp-learn-about-dlp'
         New-Row 'Deployment' 'DLP Simulation' "$pTest policies in simulation/test mode." '11_DLP_Policies_Summary' 'Use simulation, review results, pilot with a limited group, then enforce progressively.' 'dlp-create-deploy-policy'
         New-Row 'Monitoring' 'Activity Explorer' ($(if ($Script:Cache.ContainsKey('Activity')) { "$(@($Script:Cache['Activity']).Count) activity records in the last $actDays days." } else { 'Not collected (enable Activity Explorer in Settings or use -IncludeActivityExplorer).' }) + (Get-StepGap "Activity Explorer ($actDays days)")) '61_Activity_Explorer_Summary' 'Define a regular review process and required operational reports.' 'data-classification-activity-explorer'
+        New-Row 'Monitoring' 'Content Explorer' ($(if ($Script:Cache.ContainsKey('ContentExplorer')) { $ce = @($Script:Cache['ContentExplorer'] | Where-Object { $_.TagType -eq 'SensitiveInformationType' -and $_.ItemCount -gt 0 }); "$(@($ce | Select-Object -ExpandProperty TagName -Unique).Count) sensitive information types found in stored content; $(@($ce | Where-Object { -not $_.UsedInDlpRules } | Select-Object -ExpandProperty TagName -Unique).Count) of them are not used in any DLP rule." } else { 'Not collected (enable Content Explorer in Settings or use -IncludeContentExplorer).' }) + (Get-StepGap 'Content Explorer item counts')) '62_Content_Explorer_Counts' 'Confirm where sensitive information is stored and whether it is protected.' 'data-classification-content-explorer'
+        New-Row 'Monitoring' 'DLP Rule Activity' ($(if ($Script:Cache.ContainsKey('DlpAudit')) { $ra = @(Get-DlpRuleActivity); "$(($ra | Measure-Object Matches -Sum).Sum) rule matches, $(($ra | Measure-Object Overrides -Sum).Sum) overrides and $(($ra | Measure-Object FalsePositives -Sum).Sum) false-positive reports in the last $($Script:Settings.AuditDays) days." } else { 'Not collected (enable DLP rule activity in Settings or use -IncludeDlpAudit).' }) + (Get-StepGap "DLP rule activity from the audit log ($($Script:Settings.AuditDays) days)")) '65_DLP_Rule_Activity_Summary' 'Review rule matches, overrides and false positives regularly and tune rules.' 'audit-search'
         New-Row 'Monitoring' 'DLP Alerts' ("$alerting rules generate alerts or incident reports; $(@(Get-DlpAlertPolicies).Count) DLP-related alert policies." + (Get-StepGap 'Alert policies')) '51_Alert_Policies_DLP / 52_DLP_Rule_Alerting' 'Define alert severity, recipients, investigation steps and escalation routes.' 'dlp-alerts-dashboard-get-started'
         New-Row 'AI and Copilot' 'DLP and Microsoft 365 Copilot' "$($c['Copilot']) policies scoped to Microsoft 365 Copilot / Copilot Chat." '12_DLP_Workload_Coverage' 'Confirm whether Copilot and generative-AI data-loss scenarios are in scope.' 'dlp-microsoft365-copilot-location-learn-about'
         New-Row 'Governance' 'Operational Ownership' ("$(@($roleMembers | Select-Object -ExpandProperty Member -Unique).Count) people/groups hold DLP-relevant Purview roles across $(@($roleMembers | Select-Object -ExpandProperty RoleGroup -Unique).Count) role groups." + (Get-StepGap 'Purview role groups', 'Purview role group members')) '55_DLP_Relevant_Role_Members' 'Create a responsibility matrix covering security, compliance, IT, legal, HR and business owners.' 'purview-permissions'
@@ -2383,27 +3632,42 @@ function Invoke-AreaReport {
     Start-Run 'Areas'
     Export-AreaTenant
     $keys = @($AreaKeys | Where-Object { $_ -ne '1' } | Sort-Object { [int]$_ })
-    # Exchange last: it changes the loaded cmdlets
-    $keys = @($keys | Where-Object { $_ -ne '12' }) + @($keys | Where-Object { $_ -eq '12' })
+    # Exchange Online areas last: connecting to Exchange changes the loaded cmdlets
+    $exo = @($keys | Where-Object { $_ -in '12', '14' })
+    $keys = @($keys | Where-Object { $_ -notin '12', '14' })
     foreach ($k in $keys) {
         Write-Host ''
         Write-Host "--- $($Script:Areas[$k]) ---" -ForegroundColor Cyan
         & $Script:AreaFunctions[$k]
     }
+    if ($exo -contains '12') { Write-Host ''; Write-Host "--- $($Script:Areas['12']) ---" -ForegroundColor Cyan; Export-AreaExchange -WithDlpAudit:($exo -contains '14') }
+    elseif ($exo -contains '14') { Write-Host ''; Write-Host "--- $($Script:Areas['14']) ---" -ForegroundColor Cyan; Export-AreaDlpAudit }
     Complete-Run
 }
 
 function Invoke-FullReport {
     if (-not (Connect-Tenant)) { return }
     Start-Run 'Full'
+    $Script:CompareFolder = ''
+    $c = Get-IppsConnection
+    $tidNow = if ($c) { [string]$c.TenantID } else { '' }
+    if ($Script:Settings.CompareWith -eq 'Latest') { $Script:CompareFolder = Find-PreviousRun -TenantId $tidNow }
+    elseif ($Script:Settings.CompareWith) { $Script:CompareFolder = $Script:Settings.CompareWith }
+    elseif ($Script:AskCompare -and $Script:Settings.WordReport) {
+        $prev = Find-PreviousRun -TenantId $tidNow
+        if ($prev -and (Read-YesNo "  Show changes since the previous report ($(Split-Path $prev -Leaf))?" $true)) { $Script:CompareFolder = $prev }
+    }
+    if ($Script:CompareFolder) { Write-Log "Comparing with previous report: $Script:CompareFolder" }
     $keys = @('1', '2', '3', '4', '5', '6', '7', '8', '9', '10')
     if ($Script:Settings.IncludeActivity) { $keys += '11' }
+    if ($Script:Settings.IncludeContentExplorer) { $keys += '13' }
     foreach ($k in $keys) {
         Write-Host ''
         Write-Host "--- $($Script:Areas[$k]) ---" -ForegroundColor Cyan
         & $Script:AreaFunctions[$k]
     }
-    if ($Script:Settings.IncludeExchange) { Write-Host ''; Write-Host "--- $($Script:Areas['12']) ---" -ForegroundColor Cyan; Export-AreaExchange }
+    if ($Script:Settings.IncludeExchange) { Write-Host ''; Write-Host "--- $($Script:Areas['12']) ---" -ForegroundColor Cyan; Export-AreaExchange -WithDlpAudit:$Script:Settings.IncludeDlpAudit }
+    elseif ($Script:Settings.IncludeDlpAudit) { Write-Host ''; Write-Host "--- $($Script:Areas['14']) ---" -ForegroundColor Cyan; Export-AreaDlpAudit }
     Export-AssessmentSummary
     $wordPath = $null
     if ($Script:Settings.WordReport) {
@@ -2413,6 +3677,7 @@ function Invoke-FullReport {
             $Script:Errors.Add([pscustomobject]@{ Step = 'Word assessment report'; Outcome = 'Failed'; Error = $_.Exception.Message })
         }
     }
+    if ($Script:ReportObs) { try { Export-ActionPlan } catch { Write-Log "Action plan export failed: $($_.Exception.Message)" 'WARN' } }
     Complete-Run
     $html = Join-Path $Script:OutputDir '00_Assessment_Summary.html'
     Write-Host "Summary: $html" -ForegroundColor Cyan
@@ -2451,6 +3716,7 @@ function Test-TenantAccess {
         @{ Area = '10 Ownership';                   Cmdlet = 'Get-RoleGroup';                            Test = { Get-RoleGroup | Select-Object -First 1 } }
         @{ Area = '10 Ownership';                   Cmdlet = 'Get-RoleGroupMember';                      Test = { $g = Get-RoleGroup | Select-Object -First 1; if ($g) { Get-RoleGroupMember -Identity ([string]$g.Identity) | Select-Object -First 1 } } }
         @{ Area = '11 Activity Explorer';           Cmdlet = 'Export-ActivityExplorerData';              Test = { Export-ActivityExplorerData -StartTime $end.AddHours(-1) -EndTime $end -OutputFormat Json -PageSize 1 } }
+        @{ Area = '13 Content Explorer';           Cmdlet = 'Export-ContentExplorerData';               Test = { Export-ContentExplorerData -TagType SensitiveInformationType -TagName 'Credit Card Number' -Workload SPO -PageSize 1 | Out-Null } }
     )
 
     $results = foreach ($c in $checks) {
@@ -2463,10 +3729,10 @@ function Test-TenantAccess {
         [pscustomobject]@{ Area = $c.Area; Cmdlet = $c.Cmdlet; Result = $outcome; Detail = $detail }
     }
 
-    if ($Script:Settings.IncludeExchange -or ($Mode -eq 'Menu' -and (Read-YesNo 'Also test Exchange Online access (mail flow rules, audit config)?' $false))) {
+    if ($Script:Settings.IncludeExchange -or ($Mode -eq 'Menu' -and (Read-YesNo 'Also test Exchange Online access (mail flow rules, audit config, DLP rule activity)?' $false))) {
         try {
             Connect-Exo
-            foreach ($x in @(@{ C = 'Get-TransportRule'; T = { Get-TransportRule | Select-Object -First 1 } }, @{ C = 'Get-AdminAuditLogConfig'; T = { Get-AdminAuditLogConfig } })) {
+            foreach ($x in @(@{ C = 'Get-TransportRule'; T = { Get-TransportRule | Select-Object -First 1 } }, @{ C = 'Get-AdminAuditLogConfig'; T = { Get-AdminAuditLogConfig } }, @{ C = 'Search-UnifiedAuditLog'; T = { Search-UnifiedAuditLog -StartDate $end.AddDays(-1) -EndDate $end -RecordType ComplianceDLPExchange -ResultSize 1 | Out-Null } })) {
                 $o = 'MISSING'; $d = 'Cmdlet not loaded for this account.'
                 if (Get-Command $x.C -ErrorAction SilentlyContinue) { try { [void](& $x.T); $o = 'PASS'; $d = 'Cmdlet available and returned successfully.' } catch { $o = 'FAIL'; $d = $_.Exception.Message.Split([Environment]::NewLine)[0] } }
                 $results = @($results) + [pscustomobject]@{ Area = '12 Exchange Online'; Cmdlet = $x.C; Result = $o; Detail = $d }
@@ -2530,6 +3796,9 @@ function Show-Header {
     Write-Host ("   Output: {0}   Activity Explorer: {1}   Exchange: {2}" -f $Script:Settings.OutputRoot,
         $(if ($Script:Settings.IncludeActivity) { "On ($($Script:Settings.ActivityDays) days)" } else { 'Off' }),
         $(if ($Script:Settings.IncludeExchange) { 'On' } else { 'Off' })) -ForegroundColor Gray
+    Write-Host ("   Content Explorer: {0}   DLP rule activity: {1}   Customer: {2}" -f $(if ($Script:Settings.IncludeContentExplorer) { 'On' } else { 'Off' }),
+        $(if ($Script:Settings.IncludeDlpAudit) { "On ($($Script:Settings.AuditDays) days)" } else { 'Off' }),
+        $(if ($Script:Settings.CustomerName) { $Script:Settings.CustomerName } else { '(tenant name)' })) -ForegroundColor Gray
     Write-Host '--------------------------------------------------------------------------------' -ForegroundColor DarkCyan
 }
 
@@ -2564,6 +3833,14 @@ function Show-SettingsMenu {
         Write-Host "   7. Sign in with -DisableWAM           : $($Script:Settings.DisableWAM)  (use if sign-in fails or the sign-in window does not appear)"
         Write-Host "   8. Word report with complete report   : $($Script:Settings.WordReport)  (DLP_Assessment_Report.docx)"
         Write-Host "   9. Frameworks in Word report           : $(($Script:Settings.Frameworks) -join ', ')  (NCSC, NISTCSF, NIST80053, ISO27001, All, None)"
+        Write-Host "  10. Include Content Explorer in full   : $($Script:Settings.IncludeContentExplorer)  (where sensitive data is stored; needs Content Explorer List Viewer)"
+        Write-Host "  11. Content Explorer max SITs           : $($Script:Settings.ContentExplorerMaxTags)"
+        Write-Host "  12. Include DLP rule activity in full  : $($Script:Settings.IncludeDlpAudit)  (audit log; needs Exchange Online sign-in and View-Only Audit Logs)"
+        Write-Host "  13. DLP rule activity days (1-90)       : $($Script:Settings.AuditDays)"
+        Write-Host "  14. Customer name on the report         : $(if ($Script:Settings.CustomerName) { $Script:Settings.CustomerName } else { '(tenant organisation name)' })"
+        Write-Host "  15. Assessor name on the report         : $(if ($Script:Settings.AssessorName) { $Script:Settings.AssessorName } else { '(not shown)' })"
+        Write-Host "  16. Logo on the report cover (PNG/JPEG) : $(if ($Script:Settings.LogoPath) { $Script:Settings.LogoPath } else { '(none)' })"
+        Write-Host "  17. Compare with previous report folder : $(if ($Script:Settings.CompareWith) { $Script:Settings.CompareWith } else { '(ask when running option 5)' })"
         Write-Host '   B. Back'
         $s = Read-Host '  Choose'
         switch ($s.Trim().ToUpper()) {
@@ -2576,6 +3853,14 @@ function Show-SettingsMenu {
             '7' { $Script:Settings.DisableWAM = -not $Script:Settings.DisableWAM }
             '8' { $Script:Settings.WordReport = -not $Script:Settings.WordReport }
             '9' { $f = Read-Host '  Frameworks (comma separated)'; if ($f) { $Script:Settings.Frameworks = @($f -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } }
+            '10' { $Script:Settings.IncludeContentExplorer = -not $Script:Settings.IncludeContentExplorer }
+            '11' { $d = Read-Host '  Max sensitive information types (1-60)'; if ($d -as [int] -and [int]$d -ge 1 -and [int]$d -le 60) { $Script:Settings.ContentExplorerMaxTags = [int]$d } }
+            '12' { $Script:Settings.IncludeDlpAudit = -not $Script:Settings.IncludeDlpAudit }
+            '13' { $d = Read-Host '  Days'; if ($d -as [int] -and [int]$d -ge 1 -and [int]$d -le 90) { $Script:Settings.AuditDays = [int]$d } }
+            '14' { $Script:Settings.CustomerName = (Read-Host '  Customer name (blank for the tenant name)').Trim() }
+            '15' { $Script:Settings.AssessorName = (Read-Host '  Assessor name / company (blank to hide)').Trim() }
+            '16' { $p = (Read-Host '  Path to a PNG or JPEG logo (blank for none)').Trim('" '); if (-not $p -or (Test-Path $p)) { $Script:Settings.LogoPath = $p } else { Write-Host '  File not found.' -ForegroundColor Yellow; Start-Sleep 2 } }
+            '17' { $p = (Read-Host '  Previous report folder (blank to ask each time)').Trim('" '); if (-not $p -or (Test-Path $p)) { $Script:Settings.CompareWith = $p } else { Write-Host '  Folder not found.' -ForegroundColor Yellow; Start-Sleep 2 } }
             'B' { return }
         }
     }
@@ -2604,7 +3889,10 @@ function Show-MainMenu {
                 Write-Host '  Complete tenant DLP report' -ForegroundColor Cyan
                 $Script:Settings.IncludeActivity = Read-YesNo "  Include Activity Explorer data ($($Script:Settings.ActivityDays) days)?" $Script:Settings.IncludeActivity
                 $Script:Settings.IncludeExchange = Read-YesNo '  Include Exchange Online mail flow rules and audit config?' $Script:Settings.IncludeExchange
-                Invoke-FullReport; Wait-Key
+                $Script:Settings.IncludeContentExplorer = Read-YesNo '  Include Content Explorer (where sensitive data is stored; can take several minutes)?' $Script:Settings.IncludeContentExplorer
+                $Script:Settings.IncludeDlpAudit = Read-YesNo "  Include DLP rule activity from the audit log ($($Script:Settings.AuditDays) days; signs in to Exchange Online)?" $Script:Settings.IncludeDlpAudit
+                $Script:AskCompare = $true
+                Invoke-FullReport; Wait-Key; $Script:AskCompare = $false
             }
             '6' { Show-SettingsMenu }
             '7' { Disconnect-Tenant; $Script:Settings.UserPrincipalName = ''; Wait-Key }
@@ -2626,7 +3914,7 @@ switch ($Mode) {
     'TestAccess'     { Test-TenantAccess; if (-not $NoDisconnect) { Disconnect-Tenant } }
     'Full'           { Invoke-FullReport; if (-not $NoDisconnect) { Disconnect-Tenant } }
     'Area' {
-        if (-not $Area) { throw 'Use -Area with one or more area numbers (1-12), e.g. -Area 2,3,8' }
+        if (-not $Area) { throw 'Use -Area with one or more area numbers (1-14), e.g. -Area 2,3,8' }
         $keys = foreach ($a in $Area) {
             foreach ($part in ($a -split ',')) {
                 $p = $part.Trim()

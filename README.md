@@ -42,8 +42,14 @@ It is built for consultants and administrators who need a consistent evidence pa
 | Ownership | Purview role groups and members holding DLP-relevant roles |
 | Activity Explorer *(optional)* | DLP rule matches and other activity for the last 1–30 days |
 | Exchange Online *(optional)* | Mail flow rules (including legacy Exchange DLP) and unified audit log status |
+| Content Explorer *(optional)* | How many stored emails, files and Teams messages contain each sensitive information type and label, by location, and where the largest concentrations are |
+| DLP rule activity *(optional)* | DLP rule matches, overrides and false positives from the unified audit log (default 30 days) |
+
+**No Microsoft Graph.** Everything uses Security & Compliance PowerShell and, optionally, Exchange Online PowerShell.
 
 A complete run also produces a **Word assessment report** (`DLP_Assessment_Report.docx`): a plain-English document that explains what each DLP feature is and why it matters, shows what was found in the tenant, lists things to consider, and links to the relevant Microsoft Learn pages. It is built directly by the script; Microsoft Word and extra modules are not required.
+
+The report also scores the DLP programme (**maturity**), maps data types against locations (**coverage map**), explains **what actually happens** when someone shares sensitive data, runs **hygiene checks**, and ends with a **prioritised action plan** showing effort and the licence each action needs. It can show **changes since the previous report** and carry the customer's name and logo.
 
 It also produces an **assessment summary**: one row per DLP topic with an automatically calculated finding, the file that holds the evidence, a suggested next activity, and blank Status / Owner / TargetDate / Notes columns ready to use as an engagement tracker.
 
@@ -116,6 +122,7 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 ================================================================================
    Connected: admin@contoso.onmicrosoft.com  |  Tenant: 00000000-0000-...
    Output: C:\Users\you\Documents   Activity Explorer: Off   Exchange: Off
+   Content Explorer: Off   DLP rule activity: Off   Customer: (tenant name)
 --------------------------------------------------------------------------------
    1. Install / update required PowerShell modules
    2. Connect to tenant
@@ -132,9 +139,9 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 | **1. Install / update modules** | Shows installed versions, installs or updates ExchangeOnlineManagement and ImportExcel for the current user (no admin rights needed), and offers a **clean reinstall** that removes every version first when more than one is found. |
 | **2. Connect to tenant** | Signs in to Security & Compliance PowerShell, or switches to a different account or tenant. Shows the account, tenant ID and organisation, and how many key DLP cmdlets the account can use. |
 | **3. Test credentials and tenant access** | Runs a minimal read-only call against every cmdlet the reports use and shows **PASS**, **MISSING** (role or licence missing) or **FAIL** per area. Lists the account's Purview role groups and saves the results to CSV. Optionally tests Exchange Online. |
-| **4. Report on individual DLP items** | Choose one or more of the 12 [report areas](#report-areas), for example `2,3,8`. |
-| **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report and the Excel workbook. Asks whether to include Activity Explorer and Exchange Online. |
-| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, whether to create the Word report, and which frameworks it references. |
+| **4. Report on individual DLP items** | Choose one or more of the 14 [report areas](#report-areas), for example `2,3,8`. |
+| **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report, the action plan and the Excel workbook. Asks whether to include Activity Explorer, Exchange Online, Content Explorer and DLP rule activity, and, when an earlier report for the same tenant exists, whether to show the changes since then. |
+| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, the Word report and its frameworks, Content Explorer (on/off, number of types), DLP rule activity (on/off, days), **customer name, assessor name and logo** for the report cover, and a fixed folder to compare with. |
 | **7. Disconnect / switch tenant** | Signs out so you can move to the next customer tenant without restarting. |
 
 Once connected, the connection is re-used by every option. Options 3–5 connect automatically if you have not used option 2.
@@ -159,6 +166,12 @@ Use `-Mode` for repeat runs, scripting or several tenants.
 # Complete report including Activity Explorer (30 days) and Exchange Online
 .\Get-M365DlpConfiguration.ps1 -Mode Full -UserPrincipalName admin@contoso.onmicrosoft.com `
     -IncludeActivityExplorer -ActivityDays 30 -ActivityMaxPages 50 -IncludeExchange
+
+# Complete report with evidence, customer branding and comparison with the previous run
+.\Get-M365DlpConfiguration.ps1 -Mode Full -UserPrincipalName admin@contoso.onmicrosoft.com `
+    -IncludeExchange -IncludeContentExplorer -IncludeDlpAudit -AuditDays 30 `
+    -CustomerName 'Contoso Ltd' -AssessorName 'Jane Smith, Fabrikam Consulting' -LogoPath .\contoso-logo.png `
+    -CompareWith Latest
 
 # Selected areas only (policies, rules, Endpoint DLP)
 .\Get-M365DlpConfiguration.ps1 -Mode Area -Area 2,3,8 -UserPrincipalName admin@contoso.onmicrosoft.com
@@ -185,7 +198,7 @@ foreach ($t in $tenants) {
 | Parameter | Default | Description |
 |---|---|---|
 | `-Mode` | `Menu` | `Menu`, `InstallModules`, `TestAccess`, `Full` or `Area` |
-| `-Area` | | With `-Mode Area`: area numbers 1–12 or part of an area name |
+| `-Area` | | With `-Mode Area`: area numbers 1–14 or part of an area name |
 | `-OutputRoot` | Documents | Folder in which the time-stamped output folder is created |
 | `-UserPrincipalName` | | Admin account to sign in with |
 | `-IncludeActivityExplorer` | Off | Include Activity Explorer in the complete report |
@@ -195,6 +208,15 @@ foreach ($t in $tenants) {
 | `-DisableWAM` | Off | Sign in through the browser instead of the Windows account broker |
 | `-Frameworks` | All four | Frameworks referenced in the Word report: `NCSC`, `NISTCSF`, `NIST80053`, `ISO27001`, `NIST`, `ISO`, `All` or `None` |
 | `-NoWordReport` | Off | Do not create the Word assessment report with the complete report |
+| `-IncludeContentExplorer` | Off | Count stored items containing each sensitive information type and label, by location (needs Content Explorer List Viewer) |
+| `-ContentExplorerMaxTags` | `25` | Maximum number of sensitive information types queried in Content Explorer (1–60) |
+| `-IncludeDlpAudit` | Off | Read DLP rule matches, overrides and false positives from the unified audit log (signs in to Exchange Online) |
+| `-AuditDays` | `30` | Days of DLP rule activity (1–90) |
+| `-AuditMaxRecords` | `20000` | Cap on audit records read per record type |
+| `-CustomerName` | Tenant name | Shown on the report cover as "Prepared for" |
+| `-AssessorName` | | Shown on the report cover as "Prepared by" |
+| `-LogoPath` | | PNG or JPEG logo for the report cover |
+| `-CompareWith` | | A previous complete-report folder, or `Latest` for the newest earlier report for the same tenant |
 | `-NoDisconnect` | Off | Leave the session connected when the script ends |
 
 Full help: `Get-Help .\Get-M365DlpConfiguration.ps1 -Detailed`
@@ -217,6 +239,8 @@ Full help: `Get-Help .\Get-M365DlpConfiguration.ps1 -Detailed`
 | 10 | Operational ownership: role groups and members | `53`, `54`, `55` |
 | 11 | Activity Explorer | `60`, `61` |
 | 12 | Exchange Online mail flow rules and audit | `70`, `71` |
+| 13 | Content Explorer: where sensitive data is stored | `62`, `63` |
+| 14 | DLP rule activity from the audit log | `64`, `65` |
 
 ---
 
@@ -235,7 +259,9 @@ Inside each folder:
 | File | Description |
 |---|---|
 | `DLP_Assessment_Report.docx` | Complete report only. Plain-English Word report: executive summary, key observations, an explanation and findings for every area, Microsoft Learn links, glossary |
-| `00_Assessment_Summary.html` / `.csv` | Complete report only. One row per topic with findings and tracker columns |
+| `00_Assessment_Summary.html` / `.csv` | Complete report only. One row per topic with findings, the licence needed and tracker columns |
+| `80_Action_Plan.csv` | Complete report only. Prioritised actions with effort, licence, owner, target date and status columns |
+| `81_Maturity_Score`, `82_Hygiene_Checks`, `83_Changes_Since_Last_Run`, `84_Coverage_Map` | Complete report only. The scores, checks, changes and coverage map shown in the Word report |
 | `DLP_Configuration.xlsx` | Every dataset as a filterable worksheet (requires ImportExcel) |
 | `NN_Name.csv` | Flattened data for each dataset |
 | `NN_Name.json` | Full-fidelity data, including nested rule conditions |
@@ -286,27 +312,27 @@ Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Asses
 |---|---|
 | Cover and contents | Organisation, tenant ID, collection date, account used, method, confidentiality note |
 | 1. About this report | Purpose, how the data was collected (read-only), how sections are organised |
-| 2. Executive summary | Headline figures, **key observations** ranked High / Medium / Low, collection gaps, **status by area**, **framework alignment at a glance** |
+| 2. Executive summary | Headline figures, **DLP maturity** scores (0–5 for six dimensions, with changes since the last report), **changes since the last assessment**, **key observations** ranked High / Medium / Low, collection gaps, **status by area**, **framework alignment at a glance** |
 | 3. DLP policies | Each policy with mode, locations, rule count and last change date |
-| 4. Where DLP is applied | Exchange, SharePoint, OneDrive, Teams, devices, Copilot and other locations: covered or not |
-| 5. DLP rules | How rules respond (block, block with override, notify, endpoint restrictions, audit only) and a table of rules |
-| 6. User experience | Policy tips, custom tip text and overrides |
-| 7. Sensitive information types | Detectors in use and the policies that use them |
-| 8. Custom SITs and keyword dictionaries | Organisation-specific detectors and whether they are used |
-| 9. Exact Data Match | EDM schemas and EDM-based detectors |
+| 4. Where DLP is applied | Exchange, SharePoint, OneDrive, Teams, devices, Copilot and other locations: covered or not; **coverage map** of data types (financial, health, personal and ID, credentials, labelled content) against locations, showing the strongest response in each cell |
+| 5. DLP rules | How rules respond (block, block with override, notify, endpoint restrictions, audit only) and a table of rules (each rule is written out in full in Appendix E) |
+| 6. User experience | Policy tips, custom tip text and overrides; **what actually happens** scenarios, one per rule, in plain English |
+| 7. Sensitive information types | Detectors in use and the policies that use them; **where the information is stored** (Content Explorer counts by location, types found but not protected, top sites) |
+| 8. Custom SITs and keyword dictionaries | Organisation-specific detectors, what each detects, whether they are used, and each dictionary with its keyword count |
+| 9. Exact Data Match | EDM schemas with their columns (searchable columns marked) and EDM-based detectors |
 | 10. Trainable classifiers | Machine-learning classifiers referenced by rules |
 | 11. Confidence levels and instance counts | Detection thresholds, low-confidence and single-instance detections |
-| 12. Sensitivity labels and DLP | Label taxonomy, encryption, label policies, auto-labelling, labels used in DLP |
-| 13. Endpoint DLP | USB and removable storage, printing, browser and cloud uploads, tenant-wide device settings |
+| 12. Sensitivity labels and DLP | Label taxonomy, encryption, labels used in DLP; each label policy (labels published, who to, mandatory/default label settings) and each auto-labelling policy (label applied, status, where, what it looks for) |
+| 13. Endpoint DLP | USB and removable storage, printing, browser and cloud uploads; device restrictions by rule; tenant-wide device settings with friendly names |
 | 14. DLP for Microsoft 365 Copilot | Policies protecting Copilot and Copilot Chat |
-| 15. Deployment state and simulation | Enforced, simulation and disabled policies |
-| 16. Alerts and monitoring | Rules that raise alerts or incident reports, and who receives them |
-| 17. Activity Explorer | Activity summary (when Activity Explorer is included in the run) |
-| 18. Exchange mail flow and auditing | Legacy mail flow rules and unified audit log status (when Exchange Online is included) |
+| 15. Deployment state and simulation | Enforced, simulation and disabled policies; **configuration hygiene checks** (unchanged templates, high-risk rules that do not block, alert recipients, overlapping rules, stale or long-running simulation policies, default policy tips, unused detectors and labels, unprotected stored data, rules that never fire or are routinely overridden) |
+| 16. Alerts and monitoring | Rules that raise alerts or incident reports, and who receives them; each DLP alert policy with severity, trigger and recipients |
+| 17. Activity Explorer and DLP rule activity | Activity summary, and matches, overrides, false positives and distinct users per rule from the audit log (user names are kept out of the report) |
+| 18. Exchange mail flow and auditing | Each mail flow rule with its state and Exchange's own description, and unified audit log status (when Exchange Online is included) |
 | 19. Operational ownership | Role groups and members with DLP-relevant roles |
-| 20. Recommended next steps | Topic, finding and suggested activity for every DLP topic |
+| 20. Recommended next steps | **Prioritised action plan** (priority, action, effort, licence), licensing notes, and topic-by-topic findings with the licence each needs |
 | 21. Applying the configuration | Order of work and step-by-step guidance for each gap found |
-| Appendices | Collection details and gaps, glossary, evidence files, framework references |
+| Appendices | A Collection details and gaps, B Glossary, C Evidence files, D Framework references, **E DLP policies and rules in detail** |
 
 ### How each area section is laid out
 
@@ -322,6 +348,23 @@ Sections 3 to 19 all use the same layout:
 | **Learn more** | Clickable links to the relevant Microsoft Learn pages |
 
 Long tables are shortened in the report (typically to the first 40 or 60 rows) with a pointer to the CSV file that holds the full data.
+
+### Configuration details and Appendix E (no need to open the spreadsheets)
+
+The report includes the collected configuration itself, written so it can be read and reviewed without opening the CSV or Excel files. It is translated rather than dumped: GUIDs become label names, setting names become plain descriptions, and modes become phrases such as "Simulation, silent (nothing shown to users)".
+
+- **Configuration details** parts inside sections 8, 9, 12, 13, 16 and 18 cover custom SITs and dictionaries, EDM schemas, label and auto-labelling policies, device restrictions and Endpoint DLP settings, alert policies and mail flow rules.
+- **Appendix E: DLP policies and rules in detail** has one entry per policy, in priority order: a short card (mode, locations included and excluded, description, priority, last changed) followed by every rule as three plain-English lines:
+
+  | Line | Example |
+  |---|---|
+  | **When** | Content contains any of: **Credit Card Number** (high confidence, 10 or more); and content is shared with people **outside the organisation** |
+  | **Except when** | Recipient domain is: contoso-auditors.co.uk |
+  | **Then** | **Block** access for people outside the organisation; users can **override** with a business justification; send an **alert** to dlp-alerts@contoso.com |
+
+  Rules with no blocking, notification or device action are shown as **Audit only**. Where a rule groups conditions with AND / OR logic, the exact logic is in `14_DLP_Rules_Conditions_Actions`.
+
+The raw files are still produced for filtering, evidence and anything the report shortens.
 
 ### Observations and priorities
 
@@ -422,10 +465,12 @@ The simplest option is the **Compliance Administrator** role group. For least pr
 | Role groups and members | View-Only Role Management / View-Only Recipients |
 | Activity Explorer | Activity Explorer Content Viewer and Data Classification List Viewer (e.g. Information Protection Analysts) |
 | Exchange Online | Exchange View-Only Organization Management |
+| Content Explorer | Content Explorer List Viewer |
+| DLP rule activity (audit log) | View-Only Audit Logs (Exchange Online) or Audit Reader (Purview) |
 
 Role changes can take up to an hour to apply. Use **option 3** to confirm what the account can read.
 
-Some features also need licences. For example, auto-labelling, Endpoint DLP, Teams DLP, EDM and Copilot DLP generally need Microsoft 365 E5, E5 Compliance or the relevant add-on. The script reports configuration, not entitlement.
+Some features also need licences. DLP for Exchange, SharePoint and OneDrive and manual labelling are in Microsoft 365 E3 and Business Premium. Teams chat DLP, Endpoint DLP, Copilot DLP, auto-labelling, EDM, trainable classifiers, Activity Explorer and Content Explorer need Microsoft 365 E5, E5 Information Protection & Governance, or the Microsoft Purview Suite (formerly E5 Compliance). The report shows the licence each recommended action needs; it reports configuration, not entitlement, so confirm against [Microsoft's licensing guidance](https://learn.microsoft.com/en-us/office365/servicedescriptions/microsoft-365-service-descriptions/microsoft-365-tenantlevel-services-licensing-guidance/microsoft-365-security-compliance-licensing-guidance).
 
 ---
 
@@ -443,6 +488,9 @@ Some features also need licences. For example, auto-labelling, Endpoint DLP, Tea
 | `Word report failed` in the log and no `DLP_Assessment_Report.docx` | The rest of the output is complete. Check `Collection.log`, then re-run option 5. Turn the report off with Settings > 8 if needed. |
 | Word report says Activity Explorer or Exchange data was not included | Re-run option 5 and answer Yes to those prompts. |
 | No Excel workbook | Install ImportExcel (option 1), or use the CSV files. |
+| Content Explorer step fails or shows `n/a` | Add the account to **Content Explorer List Viewer**, wait up to an hour and re-run. Option 3 tests it. |
+| DLP rule activity shows no matches | Check the unified audit log is on (section 18), the account has View-Only Audit Logs, and DLP events exist in the period. Audit events can take up to 24 hours to appear. |
+| A report section says "Not available" | That part could not be built; the rest of the report is complete. The reason is in `Collection.log` and `99_Collection_Errors`. |
 | "Not connected" after an Exchange Online area | Expected. The script disconnects Exchange Online to avoid cmdlet name clashes and reconnects to Security & Compliance automatically. |
 
 ---
@@ -453,6 +501,9 @@ Some features also need licences. For example, auto-labelling, Endpoint DLP, Tea
 - **Endpoint DLP devices:** device onboarding status is not available through Security & Compliance PowerShell. Check the Purview portal (*Settings > Device onboarding*) or Microsoft Defender.
 - **Copilot locations:** Microsoft continues to change how Copilot locations are stored, so detection uses pattern matching. If a Copilot policy shows as not covered, check `11_DLP_Policies_Summary`.
 - **Activity Explorer:** large tenants can exceed the page cap. A warning is logged when data is partial.
+- **Content Explorer:** counts the sensitive information types used in rules plus a set of common built-in types (up to `-ContentExplorerMaxTags`), not every type. Top locations come from a sample of up to 500 items.
+- **DLP rule activity:** limited by audit log retention (180 days with Audit Standard) and `-AuditMaxRecords`. Exchange Online transport-rule DLP is not included.
+- **Maturity scores, coverage map and scenarios** are generated from the configuration. They are a starting point for discussion, not a formal compliance assessment.
 - **Cell size:** CSV and Excel values are truncated at 32,000 characters. Use the JSON file for the full value.
 
 ---
