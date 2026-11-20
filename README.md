@@ -8,6 +8,8 @@ It is built for consultants and administrators who need a consistent evidence pa
 
 > **Beta available:** a beta version with optional **Microsoft Graph** data (licensing for DLP features, DLP alerts raised, Microsoft Entra role holders and SharePoint sharing settings) is in the [`beta`](beta/README.md) folder. The script in this root folder is the main, supported version.
 
+> **New to the tool?** Start with the [Quick start guide](QUICKSTART.md): what the tool does, how to install the modules, connect to a tenant and run the full report. A Word version with screenshots is in [`M365-DLP-Discovery-Quick-Start-Guide.docx`](M365-DLP-Discovery-Quick-Start-Guide.docx).
+
 ---
 
 ## Contents
