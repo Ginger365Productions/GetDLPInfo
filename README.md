@@ -20,6 +20,7 @@ It is built for consultants and administrators who need a consistent evidence pa
 - [Report areas](#report-areas)
 - [Output](#output)
 - [Word assessment report](#word-assessment-report)
+- [DLP alerts dashboard](#dlp-alerts-dashboard)
 - [Permissions](#permissions)
 - [Troubleshooting](#troubleshooting)
 - [Limitations](#limitations)
@@ -43,7 +44,7 @@ It is built for consultants and administrators who need a consistent evidence pa
 | Activity Explorer *(optional)* | DLP rule matches and other activity for the last 1–30 days |
 | Exchange Online *(optional)* | Mail flow rules (including legacy Exchange DLP) and unified audit log status |
 | Content Explorer *(optional)* | How many stored emails, files and Teams messages contain each sensitive information type and label, by location, and where the largest concentrations are |
-| DLP rule activity *(optional)* | DLP rule matches, overrides and false positives from the unified audit log (default 30 days) |
+| DLP rule activity and alerts *(optional)* | DLP rule matches, overrides and false positives, and the DLP alerts raised, from the unified audit log (default 30 days), plus an **alerts dashboard** |
 
 **No Microsoft Graph.** Everything uses Security & Compliance PowerShell and, optionally, Exchange Online PowerShell.
 
@@ -131,6 +132,7 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
    5. Complete tenant DLP report
    6. Settings
    7. Disconnect / switch tenant
+   8. DLP alerts dashboard (what the DLP alerts are about)
    Q. Quit
 ```
 
@@ -143,6 +145,7 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 | **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report, the action plan and the Excel workbook. Asks whether to include Activity Explorer, Exchange Online, Content Explorer and DLP rule activity, and, when an earlier report for the same tenant exists, whether to show the changes since then. |
 | **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, the Word report and its frameworks, Content Explorer (on/off, number of types), DLP rule activity (on/off, days), **customer name, assessor name and logo** for the report cover, and a fixed folder to compare with. |
 | **7. Disconnect / switch tenant** | Signs out so you can move to the next customer tenant without restarting. |
+| **8. DLP alerts dashboard** | Asks how many days to include (1–90), reads the DLP alerts and rule matches from the unified audit log, and opens **DLP_Alerts_Dashboard.html**: an easy-to-read page explaining what the alerts are about. See [DLP alerts dashboard](#dlp-alerts-dashboard). |
 
 Once connected, the connection is re-used by every option. Options 3–5 connect automatically if you have not used option 2.
 
@@ -173,6 +176,9 @@ Use `-Mode` for repeat runs, scripting or several tenants.
     -CustomerName 'Contoso Ltd' -AssessorName 'Jane Smith, Fabrikam Consulting' -LogoPath .\contoso-logo.png `
     -CompareWith Latest
 
+# DLP alerts dashboard only (last 30 days), with people's names masked
+.\Get-M365DlpConfiguration.ps1 -Mode AlertDashboard -AuditDays 30 -MaskNamesInDashboard
+
 # Selected areas only (policies, rules, Endpoint DLP)
 .\Get-M365DlpConfiguration.ps1 -Mode Area -Area 2,3,8 -UserPrincipalName admin@contoso.onmicrosoft.com
 
@@ -197,7 +203,7 @@ foreach ($t in $tenants) {
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-Mode` | `Menu` | `Menu`, `InstallModules`, `TestAccess`, `Full` or `Area` |
+| `-Mode` | `Menu` | `Menu`, `InstallModules`, `TestAccess`, `Full`, `Area` or `AlertDashboard` |
 | `-Area` | | With `-Mode Area`: area numbers 1–14 or part of an area name |
 | `-OutputRoot` | Documents | Folder in which the time-stamped output folder is created |
 | `-UserPrincipalName` | | Admin account to sign in with |
@@ -211,7 +217,8 @@ foreach ($t in $tenants) {
 | `-IncludeContentExplorer` | Off | Count stored items containing each sensitive information type and label, by location (needs Content Explorer List Viewer) |
 | `-ContentExplorerMaxTags` | `25` | Maximum number of sensitive information types queried in Content Explorer (1–60) |
 | `-IncludeDlpAudit` | Off | Read DLP rule matches, overrides and false positives from the unified audit log (signs in to Exchange Online) |
-| `-AuditDays` | `30` | Days of DLP rule activity (1–90) |
+| `-AuditDays` | `30` | Days of DLP rule activity and alerts (1–90) |
+| `-MaskNamesInDashboard` | Off | Show people as User 1, User 2 … and hide file names and subjects in the alerts dashboard |
 | `-AuditMaxRecords` | `20000` | Cap on audit records read per record type |
 | `-CustomerName` | Tenant name | Shown on the report cover as "Prepared for" |
 | `-AssessorName` | | Shown on the report cover as "Prepared by" |
@@ -240,7 +247,7 @@ Full help: `Get-Help .\Get-M365DlpConfiguration.ps1 -Detailed`
 | 11 | Activity Explorer | `60`, `61` |
 | 12 | Exchange Online mail flow rules and audit | `70`, `71` |
 | 13 | Content Explorer: where sensitive data is stored | `62`, `63` |
-| 14 | DLP rule activity from the audit log | `64`, `65` |
+| 14 | DLP rule activity and alerts from the audit log, with the alerts dashboard | `64`–`67`, `DLP_Alerts_Dashboard.html` |
 
 ---
 
@@ -260,6 +267,8 @@ Inside each folder:
 |---|---|
 | `DLP_Assessment_Report.docx` | Complete report only. Plain-English Word report: executive summary, key observations, an explanation and findings for every area, Microsoft Learn links, glossary |
 | `00_Assessment_Summary.html` / `.csv` | Complete report only. One row per topic with findings, the licence needed and tracker columns |
+| `DLP_Alerts_Dashboard.html` | When DLP rule activity is included, or from menu option 8. Self-contained page explaining what the DLP alerts are about |
+| `66_DLP_Alert_Events`, `67_DLP_Alerts` | Alert records from the audit log, and one row per alert linked to the rule matches behind it |
 | `80_Action_Plan.csv` | Complete report only. Prioritised actions with effort, licence, owner, target date and status columns |
 | `81_Maturity_Score`, `82_Hygiene_Checks`, `83_Changes_Since_Last_Run`, `84_Coverage_Map` | Complete report only. The scores, checks, changes and coverage map shown in the Word report |
 | `DLP_Configuration.xlsx` | Every dataset as a filterable worksheet (requires ImportExcel) |
@@ -453,6 +462,27 @@ Section 6 of the [user guide](M365-DLP-Discovery-Script-User-Guide.docx) has sam
 
 ---
 
+## DLP alerts dashboard
+
+`DLP_Alerts_Dashboard.html` answers "what are our DLP alerts actually telling us?". It is one self-contained page: open it in any browser; it needs no internet access and no add-ins.
+
+| Part | What it shows |
+|---|---|
+| What the alerts are telling you | Plain-English findings: how many alerts and how severe, which rule causes most of them, the information most often found, where it happened, external domains involved, whether a few people account for most alerts (usually a business process rather than widespread risk), how many are still open, and any peak day |
+| Headline tiles | Alerts by severity, still open, people involved, alerts with external recipients, and all rule matches |
+| Alerts per day | Daily chart, coloured by severity |
+| Breakdowns | Rules raising alerts (with their policy), information found, where it happened, who triggered the alerts, external domains, alert status |
+| Rule matches with and without alerts | Shows rules that match often but never alert, and rules that alert on most matches |
+| Alerts table | Every alert with time, severity, rule, person, location, information found, file or email subject, external domains and status; search box and severity filter |
+
+**Where the data comes from:** the unified audit log, read with `Search-UnifiedAuditLog` over Exchange Online PowerShell (no Microsoft Graph). DLP alerts are the `SecurityComplianceAlerts` records in the DataLossPrevention category. Each alert is linked to the DLP rule-match events (`ComplianceDLPExchange`, `ComplianceDLPSharePoint`, `DLPEndpoint`) recorded for the same rule and person in the hour before it, which is where the information types, file or subject and recipient domains come from. External domains are those not in the tenant's accepted domains.
+
+**How to create it:** menu option 8 (asks for the number of days), `-Mode AlertDashboard`, or the complete report with DLP rule activity included (it is then also summarised in section 16 of the Word report).
+
+**Privacy:** the dashboard shows names, file names and email subjects. Turn on **Settings > 18** or use `-MaskNamesInDashboard` to show people as User 1, User 2 … and hide items.
+
+---
+
 ## Permissions
 
 The simplest option is the **Compliance Administrator** role group. For least privilege, use read-only roles:
@@ -466,7 +496,7 @@ The simplest option is the **Compliance Administrator** role group. For least pr
 | Activity Explorer | Activity Explorer Content Viewer and Data Classification List Viewer (e.g. Information Protection Analysts) |
 | Exchange Online | Exchange View-Only Organization Management |
 | Content Explorer | Content Explorer List Viewer |
-| DLP rule activity (audit log) | View-Only Audit Logs (Exchange Online) or Audit Reader (Purview) |
+| DLP rule activity, alerts and the alerts dashboard (audit log) | View-Only Audit Logs (Exchange Online) or Audit Reader (Purview) |
 
 Role changes can take up to an hour to apply. Use **option 3** to confirm what the account can read.
 
@@ -489,6 +519,7 @@ Some features also need licences. DLP for Exchange, SharePoint and OneDrive and 
 | Word report says Activity Explorer or Exchange data was not included | Re-run option 5 and answer Yes to those prompts. |
 | No Excel workbook | Install ImportExcel (option 1), or use the CSV files. |
 | Content Explorer step fails or shows `n/a` | Add the account to **Content Explorer List Viewer**, wait up to an hour and re-run. Option 3 tests it. |
+| Alerts dashboard shows alerts but "What was found" is empty | The rule-match events behind the alerts could not be read or are older than the period. Check View-Only Audit Logs and increase the number of days. |
 | DLP rule activity shows no matches | Check the unified audit log is on (section 18), the account has View-Only Audit Logs, and DLP events exist in the period. Audit events can take up to 24 hours to appear. |
 | A report section says "Not available" | That part could not be built; the rest of the report is complete. The reason is in `Collection.log` and `99_Collection_Errors`. |
 | "Not connected" after an Exchange Online area | Expected. The script disconnects Exchange Online to avoid cmdlet name clashes and reconnects to Security & Compliance automatically. |

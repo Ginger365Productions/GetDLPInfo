@@ -14,6 +14,7 @@
       6. Settings (output folder, Activity Explorer, Exchange Online, Content Explorer, DLP rule activity,
          customer name, assessor, logo, comparison with a previous report)
       7. Disconnect / switch tenant
+      8. DLP alerts dashboard (DLP alerts and rule matches for the last N days, as an easy-to-read HTML page)
 
     Areas available as individual reports:
        1  Tenant information
@@ -29,7 +30,8 @@
       11  Activity Explorer (activity data for the last N days)
       12  Exchange Online mail flow rules and audit configuration
       13  Content Explorer - how many stored items contain each sensitive information type / label
-      14  DLP rule activity from the unified audit log - matches, overrides, false positives
+      14  DLP rule activity and alerts from the unified audit log - matches, overrides, false positives, alerts,
+          plus DLP_Alerts_Dashboard.html
 
     Output for each report run goes to a new time-stamped folder:
       CSV + JSON per dataset, DLP_Configuration.xlsx (if ImportExcel is installed), Collection.log,
@@ -61,6 +63,9 @@
     record types ComplianceDLPExchange, ComplianceDLPSharePoint, DLPEndpoint) for the last AuditDays days (default 30).
     Signs in to Exchange Online; needs View-Only Audit Logs or Audit Logs. AuditMaxRecords caps records per type.
 
+.PARAMETER MaskNamesInDashboard
+    Replace people's names with User 1, User 2 ... and hide file names and subjects in DLP_Alerts_Dashboard.html.
+
 .PARAMETER CustomerName
     Name shown on the report cover ("Prepared for"). Default: the tenant organisation name.
 
@@ -75,7 +80,7 @@
     "Changes since the last assessment" and maturity changes to the report. In the menu you are asked when one exists.
 
 .PARAMETER Mode
-    Menu (default) | InstallModules | TestAccess | Full | Area
+    Menu (default) | InstallModules | TestAccess | Full | Area | AlertDashboard
 
 .PARAMETER Area
     With -Mode Area: one or more area numbers (1-14) or names, e.g. -Area 2,3,8
@@ -107,7 +112,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('Menu', 'InstallModules', 'TestAccess', 'Full', 'Area')]
+    [ValidateSet('Menu', 'InstallModules', 'TestAccess', 'Full', 'Area', 'AlertDashboard')]
     [string]$Mode = 'Menu',
     [string[]]$Area,
     [string]$OutputRoot = [Environment]::GetFolderPath('MyDocuments'),
@@ -128,6 +133,7 @@ param(
     [string]$AssessorName,
     [string]$LogoPath,
     [string]$CompareWith,
+    [switch]$MaskNamesInDashboard,
     [switch]$NoDisconnect
 )
 
@@ -154,6 +160,7 @@ $Script:Settings = [ordered]@{
     AssessorName      = $AssessorName
     LogoPath          = $LogoPath
     CompareWith       = $CompareWith
+    AlertDashboardShowNames = -not [bool]$MaskNamesInDashboard
 }
 $Script:RequiredModules = @(
     [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; MinVersion = [version]'3.2.0'; Required = $true;  Purpose = 'Security & Compliance and Exchange Online cmdlets' }
@@ -173,7 +180,7 @@ $Script:Areas = [ordered]@{
     '11' = 'Activity Explorer'
     '12' = 'Exchange Online mail flow rules and audit'
     '13' = 'Content Explorer - where sensitive data is stored'
-    '14' = 'DLP rule activity from the audit log (matches, overrides)'
+    '14' = 'DLP rule activity and alerts from the audit log (with alerts dashboard)'
 }
 
 $Script:LogFile   = $null
@@ -1163,7 +1170,14 @@ function ConvertTo-DlpAuditRows {
     $ex = Get-Val $d 'ExceptionInfo'
     $reason = [string](Get-Val $ex 'Reason'); $just = [string](Get-Val $ex 'Justification')
     $fp = [string](Get-Val $ex 'FalsePositive')
+    $em = Get-Val $d 'ExchangeMetaData'; $sm = Get-Val $d 'SharePointMetaData'
+    $item = [string](Get-Val $em 'Subject')
+    if (-not $item) { $item = [string](Get-Val $sm 'FileName') }
+    if (-not $item) { $item = [string](Get-Val $sm 'FilePathUrl') }
+    if (-not $item) { $item = [string](Get-Val $d 'ObjectId') }
+    $rcpt = @(@(Get-Val $em 'To') + @(Get-Val $em 'CC') + @(Get-Val $em 'BCC') | Where-Object { $_ } | ForEach-Object { ([string]$_ -split '@')[-1].Trim().ToLower() } | Where-Object { $_ -and $_ -notmatch '\s' } | Select-Object -Unique)
     $common = @{
+        Item = $(if ($item.Length -gt 250) { $item.Substring(0, 250) } else { $item }); RecipientDomains = ($rcpt -join ', ')
         Date = [string](Get-Val $d 'CreationTime'); Operation = [string](Get-Val $d 'Operation'); Workload = $workload; User = [string](Get-Val $d 'UserId')
         Override = [bool]($reason -match 'Override' -or $just); FalsePositive = [bool]($fp -eq 'True' -or $reason -match 'FalsePositive'); Justification = $just
     }
@@ -1177,7 +1191,7 @@ function ConvertTo-DlpAuditRows {
             $row = [ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
                 Policy = [string](Get-Val $pd 'PolicyName'); Rule = [string](Get-Val $r 'RuleName'); Severity = [string](Get-Val $r 'Severity')
                 Actions = (@(Get-Val $r 'Actions') -join ', '); SensitiveTypes = (@($sits) -join ', ')
-                Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+                Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification; Item = $common.Item; RecipientDomains = $common.RecipientDomains }
             [pscustomobject]$row; $emitted = $true
         }
     }
@@ -1186,13 +1200,13 @@ function ConvertTo-DlpAuditRows {
         [pscustomobject][ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
             Policy = [string](Get-Val $pm 'PolicyName'); Rule = [string](Get-Val $pm 'RuleName'); Severity = [string](Get-Val $d 'Severity')
             Actions = [string](Get-Val $d 'EnforcementMode'); SensitiveTypes = ''
-            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification; Item = $common.Item; RecipientDomains = $common.RecipientDomains }
         $emitted = $true
     }
     if (-not $emitted -and $common.Operation) {
         [pscustomobject][ordered]@{ Date = $common.Date; Operation = $common.Operation; Workload = $common.Workload; User = $common.User
             Policy = ''; Rule = ''; Severity = ''; Actions = ''; SensitiveTypes = ''
-            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification }
+            Override = $common.Override; FalsePositive = $common.FalsePositive; Justification = $common.Justification; Item = $common.Item; RecipientDomains = $common.RecipientDomains }
     }
 }
 
@@ -1259,7 +1273,321 @@ function Export-AreaDlpAudit {
     }
     Export-Dataset '64_DLP_Audit_Rule_Matches' @(Get-DlpAuditRecords) -AlreadyFlat
     Export-Dataset '65_DLP_Rule_Activity_Summary' @(Get-DlpRuleActivity) -AlreadyFlat
+    Export-AreaDlpAlerts
     if (-not $AlreadyConnected) { Reset-AfterExo }
+}
+
+# ---------- DLP alerts from the unified audit log (SecurityComplianceAlerts) and the alerts dashboard ----------
+
+function Get-AcceptedDomainList {
+    Get-Cached 'AcceptedDomains' {
+        if (Get-Command Get-AcceptedDomain -ErrorAction SilentlyContinue) {
+            try { @(Get-AcceptedDomain -ErrorAction Stop | ForEach-Object { ([string]$_.DomainName).ToLower() }) } catch { Write-Log "  Accepted domains not available: $($_.Exception.Message)" 'WARN' }
+        }
+    }
+}
+
+function Get-DataValue {
+    <# Reads the first matching key from an alert's Data JSON (key names vary between alert types). #>
+    param($Data, [string[]]$Keys)
+    if ($null -eq $Data) { return '' }
+    foreach ($k in $Keys) { $v = Get-Val $Data $k; if ($v) { return (ConvertTo-CellValue $v) } }
+    return ''
+}
+
+function Get-DlpAlertRecords {
+    Get-Cached 'DlpAlertEvents' {
+        $days = $Script:Settings.AuditDays
+        Invoke-Step "DLP alerts from the audit log ($days days)" -Requires Search-UnifiedAuditLog -Action {
+            $end = (Get-Date).ToUniversalTime(); $start = $end.AddDays(-$days)
+            $sid = [guid]::NewGuid().ToString(); $n = 0
+            while ($true) {
+                $page = @(Search-UnifiedAuditLog -StartDate $start -EndDate $end -RecordType SecurityComplianceAlerts -SessionId $sid -SessionCommand ReturnLargeSet -ResultSize 5000 -ErrorAction Stop)
+                if ($page.Count -eq 0) { break }
+                foreach ($rec in $page) {
+                    $d = $null; try { $d = [string]$rec.AuditData | ConvertFrom-Json } catch { continue }
+                    $cat = [string](Get-Val $d 'Category'); $name = [string](Get-Val $d 'Name')
+                    if ($cat -notmatch 'DataLossPrevention|DLP' -and $name -notmatch '^DLP|data loss') { continue }
+                    $data = $null; $raw = [string](Get-Val $d 'Data')
+                    if ($raw) { try { $data = $raw | ConvertFrom-Json } catch { } }
+                    $etype = [string](Get-Val $d 'EntityType'); $eid = [string](Get-Val $d 'AlertEntityId')
+                    $user = if ($etype -match 'User|Mailbox|Account' -and $eid) { $eid } else { Get-DataValue $data @('f3u', 'upn', 'UserId', 'eid', 'au', 'ui') }
+                    [pscustomobject][ordered]@{
+                        Time = [string](Get-Val $d 'CreationTime'); Operation = [string](Get-Val $d 'Operation'); AlertId = [string](Get-Val $d 'AlertId')
+                        Name = $name; Severity = [string](Get-Val $d 'Severity'); Status = [string](Get-Val $d 'Status'); Category = $cat
+                        PolicyId = [string](Get-Val $d 'PolicyId'); EntityType = $etype; User = $user
+                        Workload = Get-DataValue $data @('wl', 'Workload'); Comments = [string](Get-Val $d 'Comments')
+                        Data = $(if ($raw.Length -gt 2000) { $raw.Substring(0, 2000) } else { $raw })
+                    }
+                }
+                $n += $page.Count
+                $last = $page[-1]
+                $idx = [int]("0" + [string](Get-Val $last 'ResultIndex')); $total = [int]("0" + [string](Get-Val $last 'ResultCount'))
+                if ($n -ge $Script:Settings.AuditMaxRecords -or ($total -gt 0 -and $idx -ge $total) -or $page.Count -lt 5000) { break }
+            }
+        }
+    }
+}
+
+function Get-AlertRuleName {
+    <# DLP alert policies created from rules are named "DLP-<rule name>" (sometimes cut short with an ID suffix). #>
+    param([string]$AlertName, [string[]]$RuleNames)
+    $n = ($AlertName -replace '^DLP-', '' -replace '-[0-9a-f]{8}$', '').Trim()
+    $hit = $RuleNames | Where-Object { $_ -eq $n } | Select-Object -First 1
+    if (-not $hit -and $n.Length -ge 20) { $hit = $RuleNames | Where-Object { $_.StartsWith($n) -or $n.StartsWith($_) } | Select-Object -First 1 }
+    if ($hit) { return $hit } else { return $n }
+}
+
+function Get-DlpAlertSummary {
+    <# One row per alert, linked to the DLP rule match events behind it (same rule and user, up to an hour before). #>
+    Get-Cached 'DlpAlerts' {
+        $events = @(Get-DlpAlertRecords)
+        if ($events.Count -eq 0) { return }
+        $ruleNames = @(); if ($Script:Cache.ContainsKey('Rules')) { $ruleNames = @($Script:Cache['Rules'] | ForEach-Object { [string]$_.Name }) }
+        $ruleToPolicy = @{}; if ($Script:Cache.ContainsKey('Rules')) { foreach ($r in $Script:Cache['Rules']) { $ruleToPolicy[[string]$r.Name] = [string](Get-Val $r 'ParentPolicyName') } }
+        # index rule-match events by rule and by rule|user, with parsed times, so linking stays fast in large tenants
+        $byRuleUser = @{}; $byRule = @{}
+        foreach ($m in @(if ($Script:Cache.ContainsKey('DlpAudit')) { $Script:Cache['DlpAudit'] | Where-Object { $_.Rule } })) {
+            $t = ConvertTo-DateSafe $m.Date; if (-not $t) { continue }
+            $e = [pscustomobject]@{ T = $t; Ev = $m }
+            $k1 = "$($m.Rule)|$($m.User)".ToLower(); $k2 = ([string]$m.Rule).ToLower()
+            if (-not $byRuleUser.ContainsKey($k1)) { $byRuleUser[$k1] = [System.Collections.Generic.List[object]]::new() }; $byRuleUser[$k1].Add($e)
+            if (-not $byRule.ContainsKey($k2)) { $byRule[$k2] = [System.Collections.Generic.List[object]]::new() }; $byRule[$k2].Add($e)
+        }
+        $accepted = @(Get-AcceptedDomainList)
+        foreach ($g in ($events | Where-Object AlertId | Group-Object AlertId)) {
+            $ev = @($g.Group | Sort-Object { ConvertTo-DateSafe $_.Time })
+            $first = $ev | Where-Object { $_.Operation -match 'Triggered' } | Select-Object -First 1
+            if (-not $first) { $first = $ev[0] }
+            $lastStatus = ($ev | Where-Object Status | Select-Object -Last 1).Status
+            $raised = ConvertTo-DateSafe $first.Time
+            $rule = Get-AlertRuleName ([string]$first.Name) $ruleNames
+            $users = @($ev | ForEach-Object User | Where-Object { $_ } | Select-Object -Unique)
+            $cand = @(if ($users.Count) { foreach ($u in $users) { $k = "$rule|$u".ToLower(); if ($byRuleUser.ContainsKey($k)) { $byRuleUser[$k] } } } else { $k = $rule.ToLower(); if ($byRule.ContainsKey($k)) { $byRule[$k] } })
+            $rel = @(if ($raised) { $cand | Where-Object { $_.T -le $raised.AddMinutes(5) -and $_.T -ge $raised.AddMinutes(-60) } | ForEach-Object Ev })
+            $wl = @(@($ev | ForEach-Object Workload) + @($rel | ForEach-Object Workload) | Where-Object { $_ } | Select-Object -Unique)
+            $sits = @($rel | ForEach-Object { $_.SensitiveTypes -split ', ' } | Where-Object { $_ } | Select-Object -Unique)
+            $items = @($rel | ForEach-Object Item | Where-Object { $_ } | Select-Object -Unique)
+            $doms = @($rel | ForEach-Object { $_.RecipientDomains -split ', ' } | Where-Object { $_ } | Select-Object -Unique)
+            $ext = @($doms | Where-Object { $accepted.Count -eq 0 -or $accepted -notcontains $_.ToLower() })
+            [pscustomobject][ordered]@{
+                AlertId = $g.Name; Raised = $(if ($raised) { $raised.ToString('yyyy-MM-dd HH:mm') } else { [string]$first.Time })
+                Alert = [string]$first.Name; Rule = $rule; Policy = $(if ($ruleToPolicy.ContainsKey($rule)) { $ruleToPolicy[$rule] } else { '' })
+                Severity = [string]$first.Severity; Status = $(if ($lastStatus) { [string]$lastStatus } else { 'Unknown' })
+                Users = ($users -join ', '); Workloads = ($wl -join ', '); SensitiveTypes = ($sits -join ', ')
+                Items = ((@($items | Select-Object -First 5)) -join ' | '); ExternalDomains = ($ext -join ', '); LinkedMatches = $rel.Count
+            }
+        }
+    }
+}
+
+function ConvertTo-HtmlText { param($Text) [System.Net.WebUtility]::HtmlEncode([string]$Text) }
+
+function New-HtmlBars {
+    <# Horizontal bar list. Items: objects with Label, Value, optional Note. #>
+    param([object[]]$Items, [string]$Color = '#0f4c81', [int]$Max = 10, [string]$Empty = 'No data')
+    $Items = @($Items | Sort-Object Value -Descending | Select-Object -First $Max)
+    if ($Items.Count -eq 0) { return "<p class='empty'>$(ConvertTo-HtmlText $Empty)</p>" }
+    $top = [double](($Items | Measure-Object Value -Maximum).Maximum); if ($top -le 0) { $top = 1 }
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($i in $Items) {
+        $pct = [Math]::Max(2, [int](100 * $i.Value / $top))
+        $note = if ($i.Note) { "<span class='note'>$(ConvertTo-HtmlText $i.Note)</span>" } else { '' }
+        [void]$sb.Append("<div class='bar'><div class='lbl' title='$(ConvertTo-HtmlText $i.Label)'>$(ConvertTo-HtmlText $i.Label)$note</div><div class='trk'><div class='fill' style='width:$pct%;background:$Color'></div></div><div class='val'>$('{0:N0}' -f $i.Value)</div></div>")
+    }
+    return $sb.ToString()
+}
+
+function New-HtmlDailyChart {
+    <# Stacked columns per day by severity, as inline SVG. #>
+    param([object[]]$Alerts, [datetime]$Start, [datetime]$End)
+    $sevColor = [ordered]@{ High = '#c0392b'; Medium = '#e08a00'; Low = '#2e86c1'; Informational = '#8a8a8a' }
+    $days = [int][Math]::Ceiling(($End.Date - $Start.Date).TotalDays) + 1
+    $byDay = @{}
+    foreach ($a in $Alerts) {
+        $t = ConvertTo-DateSafe $a.Raised; if (-not $t) { continue }
+        $k = $t.ToString('yyyy-MM-dd'); $s = if ($sevColor.Contains([string]$a.Severity)) { [string]$a.Severity } else { 'Informational' }
+        if (-not $byDay.ContainsKey($k)) { $byDay[$k] = @{} }
+        $byDay[$k][$s] = 1 + [int]$byDay[$k][$s]
+    }
+    $maxDay = 1; foreach ($v in $byDay.Values) { $sum = 0; foreach ($x in $v.Values) { $sum += $x }; if ($sum -gt $maxDay) { $maxDay = $sum } }
+    $w = 900; $h = 180; $pad = 28; $bw = [Math]::Max(2, [Math]::Floor(($w - $pad) / [Math]::Max(1, $days)) - 2)
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.Append("<svg viewBox='0 0 $w $($h + 30)' class='chart' role='img' aria-label='Alerts per day'>")
+    [void]$sb.Append("<line x1='$pad' y1='$h' x2='$w' y2='$h' stroke='#bbb'/><text x='0' y='12' class='ax'>$maxDay</text><text x='0' y='$h' class='ax'>0</text>")
+    for ($i = 0; $i -lt $days; $i++) {
+        $day = $Start.Date.AddDays($i); $k = $day.ToString('yyyy-MM-dd'); $x = $pad + $i * ($bw + 2); $y = $h
+        if ($byDay.ContainsKey($k)) {
+            foreach ($s in $sevColor.Keys) {
+                $c = [int]$byDay[$k][$s]; if ($c -le 0) { continue }
+                $bh = [Math]::Max(1, [int](($h - 10) * $c / $maxDay)); $y -= $bh
+                [void]$sb.Append("<rect x='$x' y='$y' width='$bw' height='$bh' fill='$($sevColor[$s])'><title>$k : $c $s</title></rect>")
+            }
+        }
+        if ($i -eq 0 -or $days -le 14 -or ($days -le 45 -and $day.DayOfWeek -eq 'Monday') -or ($days -gt 45 -and $day.Day -eq 1)) {
+            [void]$sb.Append("<text x='$x' y='$($h + 16)' class='ax'>$($day.ToString('dd MMM'))</text>")
+        }
+    }
+    [void]$sb.Append('</svg>')
+    [void]$sb.Append("<div class='legend'>" + (($sevColor.Keys | ForEach-Object { "<span><i style='background:$($sevColor[$_])'></i>$_</span>" }) -join '') + '</div>')
+    return $sb.ToString()
+}
+
+function New-DlpAlertDashboard {
+    <# Writes DLP_Alerts_Dashboard.html: a single self-contained page (no internet access needed to view it). #>
+    $alerts = @(Get-DlpAlertSummary)
+    $matches2 = @(if ($Script:Cache.ContainsKey('DlpAudit')) { $Script:Cache['DlpAudit'] | Where-Object { $_.Rule -and $_.Operation -notmatch 'Undo|DlpInfo' } })
+    $days = $Script:Settings.AuditDays
+    $end = (Get-Date); $start = $end.AddDays(-$days)
+    $ti = @($Script:Cache['TenantInfo'])
+    $org = if ($Script:Settings.CustomerName) { $Script:Settings.CustomerName } elseif ($ti.Count -and $ti[0].Organization) { $ti[0].Organization } else { 'Microsoft 365 tenant' }
+
+    # optional masking of people
+    $mask = -not $Script:Settings.AlertDashboardShowNames
+    $map = @{}
+    $who = { param($u) if (-not $mask -or -not $u) { return $u }; if (-not $map.ContainsKey($u)) { $map[$u] = "User $($map.Count + 1)" }; return $map[$u] }
+
+    $total = $alerts.Count
+    $sev = @{}; foreach ($s in 'High', 'Medium', 'Low', 'Informational') { $sev[$s] = @($alerts | Where-Object Severity -eq $s).Count }
+    $open = @($alerts | Where-Object { $_.Status -match 'Active|New|InProgress|Investigating|Unknown' }).Count
+    $userList = @($alerts | ForEach-Object { $_.Users -split ', ' } | Where-Object { $_ })
+    $distinctUsers = @($userList | Select-Object -Unique).Count
+    $ruleGroups = @($alerts | Group-Object Rule | Sort-Object Count -Descending)
+    $extAlerts = @($alerts | Where-Object ExternalDomains).Count
+
+    # ---- plain-English summary
+    $ins = [System.Collections.Generic.List[string]]::new()
+    if ($total -eq 0) {
+        $ins.Add("No DLP alerts were raised in the last $days days.")
+        if ($matches2.Count) { $ins.Add("DLP rules did match <b>$('{0:N0}' -f $matches2.Count)</b> times in the same period, so the rules are working but are not set to raise alerts (or the alert threshold was not reached). See the rule matches below.") }
+        else { $ins.Add('No DLP rule matches were found either. Check the unified audit log is on and that the account can read DLP events.') }
+    }
+    else {
+        $ins.Add("<b>$total</b> DLP alerts were raised in the last $days days: <b>$($sev['High'])</b> high, <b>$($sev['Medium'])</b> medium and <b>$($sev['Low'])</b> low severity.")
+        $tr = $ruleGroups[0]; $pctR = [int](100 * $tr.Count / $total)
+        $pol = ($alerts | Where-Object Rule -eq $tr.Name | Select-Object -First 1).Policy
+        $ins.Add("Most alerts ($pctR%) come from the rule <b>$(ConvertTo-HtmlText $tr.Name)</b>$(if ($pol) { " in the policy <b>$(ConvertTo-HtmlText $pol)</b>" }).")
+        $sitAll = @($alerts | ForEach-Object { $_.SensitiveTypes -split ', ' } | Where-Object { $_ })
+        if ($sitAll.Count) { $ts = $sitAll | Group-Object | Sort-Object Count -Descending | Select-Object -First 1; $ins.Add("The information most often found was <b>$(ConvertTo-HtmlText $ts.Name)</b> (in $($ts.Count) alerts).") }
+        $wlAll = @($alerts | ForEach-Object { $_.Workloads -split ', ' } | Where-Object { $_ })
+        if ($wlAll.Count) { $tw = $wlAll | Group-Object | Sort-Object Count -Descending | Select-Object -First 1; $ins.Add("Most alerts happened in <b>$(ConvertTo-HtmlText $tw.Name)</b>.") }
+        if ($extAlerts) { $ins.Add("<b>$extAlerts</b> alerts involved recipients outside the organisation$(if ($ext1 = (@($alerts | ForEach-Object { $_.ExternalDomains -split ', ' } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 3 | ForEach-Object Name) -join ', ')) { ", most often <b>$(ConvertTo-HtmlText $ext1)</b>" }).") }
+        if ($distinctUsers -gt 0) {
+            $topU = @($userList | Group-Object | Sort-Object Count -Descending | Select-Object -First 3)
+            $share = [int](100 * (($topU | Measure-Object Count -Sum).Sum) / [Math]::Max(1, $userList.Count))
+            if ($distinctUsers -ge 4 -and $share -ge 60) { $ins.Add("Three people account for <b>$share%</b> of alerts. That usually points to a business process (for example a team that routinely sends this data) rather than widespread risk: confirm with them and consider an exception or a safer way to share.") }
+            else { $ins.Add("Alerts involve <b>$distinctUsers</b> different people, so the behaviour is spread across the organisation; user awareness and policy tips will help.") }
+        }
+        if ($open) { $ins.Add("<b>$open</b> alerts are still open (not resolved). Agree who triages DLP alerts and how quickly.") }
+        $peak = @($alerts | Where-Object { ([string]$_.Raised).Length -ge 10 } | Group-Object { ([string]$_.Raised).Substring(0, 10) } | Sort-Object Count -Descending | Select-Object -First 1)
+        if ($peak.Count -and $peak[0].Count -ge [Math]::Max(5, 3 * $total / [Math]::Max(1, $days))) { $ins.Add("Alerts peaked on <b>$($peak[0].Name)</b> ($($peak[0].Count) alerts); check what happened that day, such as a bulk upload or a mailing.") }
+        $unlinked = @($alerts | Where-Object { $_.LinkedMatches -eq 0 }).Count
+        if ($unlinked -eq $total) { $ins.Add("The rule match events behind the alerts could not be read, so what was found and where it was going are not shown. The account may need the <b>View-Only Audit Logs</b> role, or matches may be older than the search period.") }
+    }
+
+    # ---- datasets for the panels
+    $byRule = @($ruleGroups | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count; Note = (($alerts | Where-Object Rule -eq $_.Name | Select-Object -First 1).Policy) } })
+    $bySit = @($alerts | ForEach-Object { $_.SensitiveTypes -split ', ' } | Where-Object { $_ } | Group-Object | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count } })
+    $sitTitle = 'What information was found (alerts)'
+    if ($bySit.Count -eq 0 -and $matches2.Count) { $bySit = @($matches2 | ForEach-Object { $_.SensitiveTypes -split ', ' } | Where-Object { $_ } | Group-Object | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count } }); $sitTitle = 'What information was found (all rule matches)' }
+    $byWl = @($alerts | ForEach-Object { $_.Workloads -split ', ' } | Where-Object { $_ } | Group-Object | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count } })
+    $byUser = @($userList | Group-Object | ForEach-Object { [pscustomobject]@{ Label = (& $who $_.Name); Value = $_.Count } })
+    $byDom = @($alerts | ForEach-Object { $_.ExternalDomains -split ', ' } | Where-Object { $_ } | Group-Object | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count } })
+    $byStatus = @($alerts | Group-Object Status | ForEach-Object { [pscustomobject]@{ Label = $_.Name; Value = $_.Count } })
+    $matchByRule = @($matches2 | Group-Object Rule | ForEach-Object {
+            $rn = $_.Name; $ac = @($alerts | Where-Object Rule -eq $rn).Count
+            [pscustomobject]@{ Label = $rn; Value = $_.Count; Note = $(if ($ac) { "$ac alerts" } else { 'no alerts' }) } })
+
+    $css = @'
+*{box-sizing:border-box}body{margin:0;font-family:"Segoe UI",Arial,sans-serif;background:#f3f5f8;color:#1f2a37}
+header{background:#0f4c81;color:#fff;padding:22px 32px}header h1{margin:0;font-size:24px;font-weight:600}header p{margin:6px 0 0;opacity:.85;font-size:14px}
+main{max-width:1180px;margin:0 auto;padding:22px 24px 40px}
+.card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:18px 20px;margin-bottom:18px}
+.card h2{font-size:16px;margin:0 0 12px;color:#0f4c81}
+.summary ul{margin:0;padding-left:20px;line-height:1.6}.summary li{margin-bottom:4px}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(122px,1fr));gap:12px;margin-bottom:18px}
+.kpi{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.08);padding:14px 16px;border-top:4px solid #0f4c81}
+.kpi b{display:block;font-size:28px}.kpi span{font-size:13px;color:#555}
+.kpi.high{border-color:#c0392b}.kpi.med{border-color:#e08a00}.kpi.low{border-color:#2e86c1}.kpi.open{border-color:#7d3c98}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}@media(max-width:860px){.grid{grid-template-columns:1fr}}
+.bar{display:grid;grid-template-columns:minmax(140px,52%) 1fr 56px;gap:10px;align-items:center;margin:6px 0;font-size:13px}
+.lbl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.note{display:block;color:#777;font-size:11px}
+.trk{background:#eef1f5;border-radius:4px;height:14px}.fill{height:14px;border-radius:4px}.val{text-align:right;font-weight:600}
+.chart{width:100%;height:auto}.ax{font-size:10px;fill:#666}.legend{font-size:12px;margin-top:6px}.legend span{margin-right:14px}.legend i{display:inline-block;width:10px;height:10px;margin-right:5px;border-radius:2px}
+.empty{color:#777;font-style:italic}
+table{width:100%;border-collapse:collapse;font-size:12.5px}th{background:#0f4c81;color:#fff;text-align:left;padding:7px;position:sticky;top:0}td{border-bottom:1px solid #e3e7ec;padding:6px 7px;vertical-align:top}
+tr:nth-child(even) td{background:#f8fafc}.sev{padding:2px 8px;border-radius:10px;color:#fff;font-size:11px;font-weight:600}
+.sev.High{background:#c0392b}.sev.Medium{background:#e08a00}.sev.Low{background:#2e86c1}.sev.Informational{background:#8a8a8a}
+.tools{display:flex;gap:10px;margin-bottom:10px;flex-wrap:wrap}.tools input,.tools select{padding:7px 9px;border:1px solid #c9d1db;border-radius:6px;font-size:13px}.tools input{flex:1;min-width:220px}
+.scroll{max-height:560px;overflow:auto}footer{font-size:12px;color:#666;max-width:1180px;margin:0 auto;padding:0 24px 30px}
+'@
+    $js = @'
+function filt(){var q=document.getElementById('q').value.toLowerCase(),s=document.getElementById('s').value,n=0;
+document.querySelectorAll('#t tbody tr').forEach(function(r){var ok=(!q||r.textContent.toLowerCase().indexOf(q)>=0)&&(!s||r.getAttribute('data-sev')===s);r.style.display=ok?'':'none';if(ok)n++;});
+document.getElementById('n').textContent=n+' shown';}
+'@
+    $h = [System.Text.StringBuilder]::new()
+    [void]$h.Append("<!DOCTYPE html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>DLP alerts - $(ConvertTo-HtmlText $org)</title><style>$css</style></head><body>")
+    [void]$h.Append("<header><h1>DLP alerts dashboard</h1><p>$(ConvertTo-HtmlText $org) &middot; last $days days ($($start.ToString('dd MMM yyyy')) to $($end.ToString('dd MMM yyyy'))) &middot; generated $($end.ToString('dd MMM yyyy HH:mm'))</p></header><main>")
+    [void]$h.Append("<div class='card summary'><h2>What the alerts are telling you</h2><ul>" + (($ins | ForEach-Object { "<li>$_</li>" }) -join '') + '</ul></div>')
+    [void]$h.Append("<div class='kpis'><div class='kpi'><b>$total</b><span>DLP alerts</span></div><div class='kpi high'><b>$($sev['High'])</b><span>High severity</span></div><div class='kpi med'><b>$($sev['Medium'])</b><span>Medium severity</span></div><div class='kpi low'><b>$($sev['Low'])</b><span>Low severity</span></div><div class='kpi open'><b>$open</b><span>Still open</span></div><div class='kpi'><b>$distinctUsers</b><span>People involved</span></div><div class='kpi'><b>$extAlerts</b><span>Alerts with external recipients</span></div><div class='kpi'><b>$('{0:N0}' -f $matches2.Count)</b><span>DLP rule matches (all)</span></div></div>")
+    [void]$h.Append("<div class='card'><h2>Alerts per day</h2>$(New-HtmlDailyChart -Alerts $alerts -Start $start -End $end)</div>")
+    [void]$h.Append("<div class='grid'><div class='card'><h2>Which rules raise the alerts</h2>$(New-HtmlBars $byRule '#0f4c81' 10 'No alerts')</div><div class='card'><h2>$sitTitle</h2>$(New-HtmlBars $bySit '#1e7b34' 10 'Not available: the rule match details could not be linked')</div></div>")
+    [void]$h.Append("<div class='grid'><div class='card'><h2>Where it happened</h2>$(New-HtmlBars $byWl '#2e86c1' 8 'Not available')</div><div class='card'><h2>Who triggered the alerts</h2>$(New-HtmlBars $byUser '#7d3c98' 10 'Not available')</div></div>")
+    [void]$h.Append("<div class='grid'><div class='card'><h2>Where it was going (external domains)</h2>$(New-HtmlBars $byDom '#c0392b' 10 'No external recipients found in the linked events')</div><div class='card'><h2>Alert status</h2>$(New-HtmlBars $byStatus '#5d6d7e' 6 'No alerts')</div></div>")
+    [void]$h.Append("<div class='card'><h2>All DLP rule matches by rule (with and without alerts)</h2>$(New-HtmlBars $matchByRule '#8e9aaf' 15 'No rule matches were read (DLP rule activity not collected)')</div>")
+    [void]$h.Append("<div class='card'><h2>Alerts</h2><div class='tools'><input id='q' placeholder='Search alerts, people, information types, files...' oninput='filt()'><select id='s' onchange='filt()'><option value=''>All severities</option><option>High</option><option>Medium</option><option>Low</option><option>Informational</option></select><span id='n' style='align-self:center;font-size:12px;color:#666'></span></div><div class='scroll'><table id='t'><thead><tr><th>Raised</th><th>Severity</th><th>Rule</th><th>Who</th><th>Where</th><th>What was found</th><th>Item</th><th>External</th><th>Status</th></tr></thead><tbody>")
+    foreach ($a in ($alerts | Sort-Object Raised -Descending | Select-Object -First 2000)) {
+        $people = (@($a.Users -split ', ' | Where-Object { $_ } | ForEach-Object { & $who $_ }) -join ', ')
+        $item = if ($mask) { $(if ($a.Items) { '(hidden)' } else { '' }) } else { $a.Items }
+        [void]$h.Append("<tr data-sev='$(ConvertTo-HtmlText $a.Severity)'><td>$(ConvertTo-HtmlText $a.Raised)</td><td><span class='sev $(ConvertTo-HtmlText $a.Severity)'>$(ConvertTo-HtmlText $a.Severity)</span></td><td>$(ConvertTo-HtmlText $a.Rule)</td><td>$(ConvertTo-HtmlText $people)</td><td>$(ConvertTo-HtmlText $a.Workloads)</td><td>$(ConvertTo-HtmlText $a.SensitiveTypes)</td><td>$(ConvertTo-HtmlText $item)</td><td>$(ConvertTo-HtmlText $a.ExternalDomains)</td><td>$(ConvertTo-HtmlText $a.Status)</td></tr>")
+    }
+    [void]$h.Append('</tbody></table></div></div></main>')
+    [void]$h.Append("<footer>Source: the unified audit log (DLP alert records and DLP rule match records) read with Exchange Online PowerShell; no Microsoft Graph. 'What was found', 'Item' and 'External' come from the rule match events recorded up to an hour before each alert for the same rule and person. $(if ($mask) { 'People and items are masked (Settings).' } else { 'This page contains user names and file or email subjects: store and share it in line with the organisation''s data handling policy.' }) Detail: 66_DLP_Alert_Events, 67_DLP_Alerts, 64_DLP_Audit_Rule_Matches.</footer>")
+    [void]$h.Append("<script>$js filt();</script></body></html>")
+    $path = Join-Path $Script:OutputDir 'DLP_Alerts_Dashboard.html'
+    [IO.File]::WriteAllText($path, $h.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    $Script:Cache['AlertDashboardPath'] = @($path)
+    Write-Log "Alerts dashboard: $path" 'OK'
+    return $path
+}
+
+function Export-AreaDlpAlerts {
+    <# Expects Exchange Online to be connected. Rule-match events (Get-DlpAuditRecords) are read first so alerts can be linked to them. #>
+    [void](Get-AcceptedDomainList)
+    [void](Get-DlpAuditRecords)
+    Export-Dataset '66_DLP_Alert_Events' @(Get-DlpAlertRecords) -AlreadyFlat
+    Export-Dataset '67_DLP_Alerts' @(Get-DlpAlertSummary) -AlreadyFlat
+    try { [void](New-DlpAlertDashboard) }
+    catch {
+        Write-Log "Alerts dashboard failed: $($_.Exception.Message)" 'ERROR'
+        $Script:Errors.Add([pscustomobject]@{ Step = 'DLP alerts dashboard'; Outcome = 'Failed'; Error = $_.Exception.Message })
+    }
+}
+
+function Invoke-AlertDashboard {
+    <# Menu option 8 / -Mode AlertDashboard: DLP alerts and rule matches for the last N days, as a dashboard. #>
+    if (-not (Connect-Tenant)) { return }
+    Start-Run 'Alerts'
+    Export-AreaTenant
+    # Security & Compliance data first (rule and policy names), then Exchange Online for the audit log
+    [void](Get-Rules); [void](Get-RuleClassifiers)
+    try { Connect-Exo }
+    catch {
+        Write-Log "Exchange Online connection failed: $($_.Exception.Message)" 'ERROR'
+        $Script:Errors.Add([pscustomobject]@{ Step = 'DLP alerts dashboard'; Outcome = 'Failed'; Error = $_.Exception.Message })
+        Complete-Run; return
+    }
+    Export-Dataset '64_DLP_Audit_Rule_Matches' @(Get-DlpAuditRecords) -AlreadyFlat
+    Export-Dataset '65_DLP_Rule_Activity_Summary' @(Get-DlpRuleActivity) -AlreadyFlat
+    Export-AreaDlpAlerts
+    Reset-AfterExo
+    Complete-Run
+    $p = @($Script:Cache['AlertDashboardPath'])
+    if ($p.Count -and (Test-Path $p[0])) {
+        Write-Host "Dashboard: $($p[0])" -ForegroundColor Cyan
+        if ($Mode -eq 'Menu') { try { Invoke-Item $p[0] } catch { } }
+    }
 }
 
 $Script:AreaFunctions = @{
@@ -3271,6 +3599,23 @@ function New-DlpWordReport {
         Add-DocTable -Headers @('Alert policy', 'Severity', 'State', 'Raised when', 'Email recipients') -Widths @(2.6, 0.9, 0.7, 1.8, 2.5) -FontSize 16 -Rows @(Get-AlertPolicyRows $alertPol) -MaxRows 30
     }
     $cons = @()
+    try {
+        if ($Script:Cache.ContainsKey('DlpAlertEvents')) {
+            $al = @(if ($Script:Cache.ContainsKey('DlpAlerts')) { $Script:Cache['DlpAlerts'] })
+            Add-DocHeading "DLP alerts raised (audit log, last $($Script:Settings.AuditDays) days)" 3
+            if ($al.Count -eq 0) { Add-DocPara 'No DLP alerts were raised in the period.' }
+            else {
+                $openA = @($al | Where-Object { $_.Status -match 'Active|New|InProgress|Investigating|Unknown' }).Count
+                Add-DocPara "**$($al.Count)** DLP alerts were raised: $(@($al | Where-Object Severity -eq 'High').Count) high, $(@($al | Where-Object Severity -eq 'Medium').Count) medium and $(@($al | Where-Object Severity -eq 'Low').Count) low severity; **$openA** still open. **DLP_Alerts_Dashboard.html** in the output folder shows what the alerts are about: the rules, information types, locations, people and external domains involved."
+                Add-DocTable -Headers @('Rule raising alerts', 'Alerts', 'Most common information found', 'External recipients') -Widths @(3, 0.8, 3, 1.5) -FontSize 16 -Rows @(foreach ($g in ($al | Group-Object Rule | Sort-Object Count -Descending | Select-Object -First 10)) {
+                        $ts = @($g.Group | ForEach-Object { $_.SensitiveTypes -split ', ' } | Where-Object { $_ } | Group-Object | Sort-Object Count -Descending | Select-Object -First 2 | ForEach-Object Name)
+                        , @([string]$g.Name, [string]$g.Count, $(if ($ts.Count) { $ts -join ', ' } else { 'Not linked' }), [string]@($g.Group | Where-Object ExternalDomains).Count)
+                    }) -Note 'Detail: 67_DLP_Alerts (one row per alert) and 66_DLP_Alert_Events.'
+                if ($openA -gt 0 -and $openA -ge $al.Count / 2) { $cons += Add-Obs 'Alerts' 'Medium' "$openA of $($al.Count) DLP alerts in the period are still open. Agree who triages DLP alerts, how quickly, and how they are closed." }
+            }
+        }
+    }
+    catch { Add-ReportPartError 'DLP alerts raised' $_ }
     if ($ruleAlert.Count -eq 0 -and $rules.Count -gt 0) { $cons += Add-Obs 'Alerts' 'High' 'No DLP rules raise alerts, so nobody is notified of policy matches.' }
     $siteOnly = @($ruleAlert | Where-Object { ([string]$_.GenerateAlert + [string]$_.GenerateIncidentReport) -match '^(SiteAdmin\s*\|?\s*)+$' })
     if ($siteOnly.Count -gt 0) { $cons += Add-Obs 'Alerts' 'Medium' "$(Get-Plural $siteOnly.Count 'rule sends' 'rules send') alerts only to SiteAdmin. Route alerts to a named team or shared mailbox with a defined triage process." }
@@ -3442,6 +3787,7 @@ function New-DlpWordReport {
         , @('53-55_Purview_Role...', 'Role groups and members')
         , @('62 / 63_Content_Explorer...', 'Items containing each sensitive information type and label, and top locations')
         , @('64 / 65_DLP_Audit... / Rule_Activity...', 'DLP rule matches, overrides and false positives from the audit log (64 contains user names)')
+        , @('66 / 67_DLP_Alert... and DLP_Alerts_Dashboard.html', 'DLP alerts from the audit log, linked to the rule matches behind them, and the alerts dashboard')
         , @('80_Action_Plan', 'Prioritised action plan with effort, licence, owner and target date columns')
         , @('81-84', 'Maturity scores, hygiene checks, changes since the last report and the coverage map')
         , @('99_Collection_Errors', 'Steps skipped or failed')
@@ -3634,6 +3980,7 @@ function Invoke-AreaReport {
     $keys = @($AreaKeys | Where-Object { $_ -ne '1' } | Sort-Object { [int]$_ })
     # Exchange Online areas last: connecting to Exchange changes the loaded cmdlets
     $exo = @($keys | Where-Object { $_ -in '12', '14' })
+    if ($exo -contains '14') { [void](Get-Rules) }   # rule names are needed to link alerts to rules
     $keys = @($keys | Where-Object { $_ -notin '12', '14' })
     foreach ($k in $keys) {
         Write-Host ''
@@ -3682,6 +4029,7 @@ function Invoke-FullReport {
     $html = Join-Path $Script:OutputDir '00_Assessment_Summary.html'
     Write-Host "Summary: $html" -ForegroundColor Cyan
     if ($wordPath) { Write-Host "Word report: $wordPath" -ForegroundColor Cyan }
+    if ($Script:Cache.ContainsKey('AlertDashboardPath')) { Write-Host "Alerts dashboard: $(@($Script:Cache['AlertDashboardPath'])[0])" -ForegroundColor Cyan }
 }
 
 #endregion
@@ -3835,12 +4183,13 @@ function Show-SettingsMenu {
         Write-Host "   9. Frameworks in Word report           : $(($Script:Settings.Frameworks) -join ', ')  (NCSC, NISTCSF, NIST80053, ISO27001, All, None)"
         Write-Host "  10. Include Content Explorer in full   : $($Script:Settings.IncludeContentExplorer)  (where sensitive data is stored; needs Content Explorer List Viewer)"
         Write-Host "  11. Content Explorer max SITs           : $($Script:Settings.ContentExplorerMaxTags)"
-        Write-Host "  12. Include DLP rule activity in full  : $($Script:Settings.IncludeDlpAudit)  (audit log; needs Exchange Online sign-in and View-Only Audit Logs)"
-        Write-Host "  13. DLP rule activity days (1-90)       : $($Script:Settings.AuditDays)"
+        Write-Host "  12. Include DLP rule activity in full  : $($Script:Settings.IncludeDlpAudit)  (rule matches, alerts and alerts dashboard from the audit log; needs Exchange Online and View-Only Audit Logs)"
+        Write-Host "  13. Rule activity / alerts days (1-90)  : $($Script:Settings.AuditDays)"
         Write-Host "  14. Customer name on the report         : $(if ($Script:Settings.CustomerName) { $Script:Settings.CustomerName } else { '(tenant organisation name)' })"
         Write-Host "  15. Assessor name on the report         : $(if ($Script:Settings.AssessorName) { $Script:Settings.AssessorName } else { '(not shown)' })"
         Write-Host "  16. Logo on the report cover (PNG/JPEG) : $(if ($Script:Settings.LogoPath) { $Script:Settings.LogoPath } else { '(none)' })"
         Write-Host "  17. Compare with previous report folder : $(if ($Script:Settings.CompareWith) { $Script:Settings.CompareWith } else { '(ask when running option 5)' })"
+        Write-Host "  18. Names in the alerts dashboard       : $(if ($Script:Settings.AlertDashboardShowNames) { 'Shown' } else { 'Masked (User 1, User 2 ...)' })"
         Write-Host '   B. Back'
         $s = Read-Host '  Choose'
         switch ($s.Trim().ToUpper()) {
@@ -3860,6 +4209,7 @@ function Show-SettingsMenu {
             '14' { $Script:Settings.CustomerName = (Read-Host '  Customer name (blank for the tenant name)').Trim() }
             '15' { $Script:Settings.AssessorName = (Read-Host '  Assessor name / company (blank to hide)').Trim() }
             '16' { $p = (Read-Host '  Path to a PNG or JPEG logo (blank for none)').Trim('" '); if (-not $p -or (Test-Path $p)) { $Script:Settings.LogoPath = $p } else { Write-Host '  File not found.' -ForegroundColor Yellow; Start-Sleep 2 } }
+            '18' { $Script:Settings.AlertDashboardShowNames = -not $Script:Settings.AlertDashboardShowNames }
             '17' { $p = (Read-Host '  Previous report folder (blank to ask each time)').Trim('" '); if (-not $p -or (Test-Path $p)) { $Script:Settings.CompareWith = $p } else { Write-Host '  Folder not found.' -ForegroundColor Yellow; Start-Sleep 2 } }
             'B' { return }
         }
@@ -3876,6 +4226,7 @@ function Show-MainMenu {
         Write-Host '   5. Complete tenant DLP report'
         Write-Host '   6. Settings'
         Write-Host '   7. Disconnect / switch tenant'
+        Write-Host '   8. DLP alerts dashboard (what the DLP alerts are about)'
         Write-Host '   Q. Quit'
         Write-Host ''
         $choice = Read-Host '  Choose an option'
@@ -3890,12 +4241,20 @@ function Show-MainMenu {
                 $Script:Settings.IncludeActivity = Read-YesNo "  Include Activity Explorer data ($($Script:Settings.ActivityDays) days)?" $Script:Settings.IncludeActivity
                 $Script:Settings.IncludeExchange = Read-YesNo '  Include Exchange Online mail flow rules and audit config?' $Script:Settings.IncludeExchange
                 $Script:Settings.IncludeContentExplorer = Read-YesNo '  Include Content Explorer (where sensitive data is stored; can take several minutes)?' $Script:Settings.IncludeContentExplorer
-                $Script:Settings.IncludeDlpAudit = Read-YesNo "  Include DLP rule activity from the audit log ($($Script:Settings.AuditDays) days; signs in to Exchange Online)?" $Script:Settings.IncludeDlpAudit
+                $Script:Settings.IncludeDlpAudit = Read-YesNo "  Include DLP rule activity and alerts from the audit log, with the alerts dashboard ($($Script:Settings.AuditDays) days; signs in to Exchange Online)?" $Script:Settings.IncludeDlpAudit
                 $Script:AskCompare = $true
                 Invoke-FullReport; Wait-Key; $Script:AskCompare = $false
             }
             '6' { Show-SettingsMenu }
             '7' { Disconnect-Tenant; $Script:Settings.UserPrincipalName = ''; Wait-Key }
+            '8' {
+                Show-Header
+                Write-Host '  DLP alerts dashboard' -ForegroundColor Cyan
+                Write-Host '  Reads DLP alerts and rule matches from the unified audit log (signs in to Exchange Online) and builds DLP_Alerts_Dashboard.html.' -ForegroundColor Gray
+                $d = Read-Host "  How many days to include (1-90) [$($Script:Settings.AuditDays)]"
+                if ($d -as [int] -and [int]$d -ge 1 -and [int]$d -le 90) { $Script:Settings.AuditDays = [int]$d }
+                Invoke-AlertDashboard; Wait-Key
+            }
             'Q' {
                 if (-not $NoDisconnect) { Disconnect-Tenant }
                 return
@@ -3913,6 +4272,7 @@ switch ($Mode) {
     'InstallModules' { Install-RequiredModules }
     'TestAccess'     { Test-TenantAccess; if (-not $NoDisconnect) { Disconnect-Tenant } }
     'Full'           { Invoke-FullReport; if (-not $NoDisconnect) { Disconnect-Tenant } }
+    'AlertDashboard' { Invoke-AlertDashboard; if (-not $NoDisconnect) { Disconnect-Tenant } }
     'Area' {
         if (-not $Area) { throw 'Use -Area with one or more area numbers (1-14), e.g. -Area 2,3,8' }
         $keys = foreach ($a in $Area) {
