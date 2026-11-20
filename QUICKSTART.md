@@ -12,7 +12,9 @@ This guide gets you from download to a finished DLP audit report in about 15 min
 - **`DLP_Alerts_Dashboard.html`** *(optional)*: an easy-to-read page showing what the DLP alerts are about.
 - **`DLP_Configuration.xlsx`** plus CSV and JSON files: all the raw data.
 
-It is **read-only**: it never changes anything in the tenant. It does not use Microsoft Graph.
+It is **read-only**: it never changes anything in the tenant, and it does not use Microsoft Graph.
+
+> **Why are there `Set-` and `New-` commands in the code?** They are example commands that the script writes into section 21 of the Word report, for the customer to review. The script never runs them. The only tenant commands it runs are `Get-*`, `Export-ActivityExplorerData`, `Export-ContentExplorerData` and `Search-UnifiedAuditLog`, which only read data. The only things it changes are files in its output folder on your PC, plus PowerShell modules if you choose to install them in option 1. Full details: [Is it really read-only?](README.md#is-it-really-read-only)
 
 ---
 

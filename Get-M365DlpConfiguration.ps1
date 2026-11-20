@@ -42,6 +42,13 @@
 
     No Microsoft Graph: everything uses Security & Compliance PowerShell and, optionally, Exchange Online PowerShell.
 
+    READ-ONLY: the only tenant commands the script runs are Get-*, Export-ActivityExplorerData,
+    Export-ContentExplorerData and Search-UnifiedAuditLog (all of which only read data), plus Connect-/Disconnect-.
+    Set-/New- DLP, label and audit commands appear ONLY as example text inside @' '@ blocks in
+    Add-ImplementationGuidance, which prints them into section 21 of the Word report for the customer to review.
+    They are never executed. Commands that write files (New-Item, Set-Content, Remove-Item on the report file)
+    act only on the output folder; Install-/Uninstall-Module run only from menu option 1 after you confirm.
+
 .PARAMETER Frameworks
     Frameworks referenced in the Word report: any of NCSC, NISTCSF, NIST80053, ISO27001 (or NIST, ISO, All, None).
     Default: all four.
@@ -2111,6 +2118,11 @@ function Add-FrameworkMatrix {
 }
 
 function Add-ImplementationGuidance {
+    <#
+        Writes section 21 of the Word report. The Set-/New- commands in the @' '@ blocks below are EXAMPLE TEXT
+        for the customer: they are passed to Add-DocCode as strings and printed into the report. Nothing in this
+        function runs a command against the tenant.
+    #>
     param($Ctx)
     Add-DocHeading '21. Applying the configuration' 1
     Add-DocPara 'This section gives practical guidance for the gaps found in this assessment. Only guidance relevant to this tenant is included. Each item shows why it applies, which framework references it supports, the steps in the Microsoft Purview portal, an example PowerShell command, and how to check the change worked.'

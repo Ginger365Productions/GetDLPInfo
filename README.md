@@ -4,7 +4,7 @@ A read-only PowerShell tool for discovering and documenting **Microsoft Purview 
 
 It is built for consultants and administrators who need a consistent evidence pack at the start of a DLP engagement. Run it the same way in every tenant, get the same set of outputs, and compare tenants or runs over time.
 
-> **Read-only:** the script only calls `Get-*` and `Export-*` cmdlets. It never creates, changes, enables or deletes anything in the tenant. The only files it writes are its output files on your workstation.
+> **Read-only:** the script only reads from the tenant. It never creates, changes, enables or deletes any policy, rule, label or setting. The `Set-`/`New-` commands you will see in the code are example text for the Word report, not commands it runs; see [Is it really read-only?](#is-it-really-read-only).
 
 > **Beta available:** a beta version with optional **Microsoft Graph** data (licensing for DLP features, DLP alerts raised, Microsoft Entra role holders and SharePoint sharing settings) is in the [`beta`](beta/README.md) folder. The script in this root folder is the main, supported version.
 
@@ -14,6 +14,7 @@ It is built for consultants and administrators who need a consistent evidence pa
 
 ## Contents
 
+- [Is it really read-only?](#is-it-really-read-only)
 - [What it collects](#what-it-collects)
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
@@ -55,6 +56,47 @@ A complete run also produces a **Word assessment report** (`DLP_Assessment_Repor
 The report also scores the DLP programme (**maturity**), maps data types against locations (**coverage map**), explains **what actually happens** when someone shares sensitive data, runs **hygiene checks**, and ends with a **prioritised action plan** showing effort and the licence each action needs. It can show **changes since the previous report** and carry the customer's name and logo.
 
 It also produces an **assessment summary**: one row per DLP topic with an automatically calculated finding, the file that holds the evidence, a suggested next activity, and blank Status / Owner / TargetDate / Notes columns ready to use as an engagement tracker.
+
+---
+
+## Is it really read-only?
+
+Yes. If you look through the script you will see `Set-` and `New-` commands, so here is exactly what they are.
+
+**Commands that read from the tenant (the only tenant commands the script runs)**
+
+| Command | What it does |
+|---|---|
+| `Get-*` (for example `Get-DlpCompliancePolicy`, `Get-Label`, `Get-TransportRule`) | Read configuration |
+| `Export-ActivityExplorerData`, `Export-ContentExplorerData` | Despite the name, these only **read** data from Purview and return it to the script |
+| `Search-UnifiedAuditLog` | Reads DLP rule matches and alerts from the audit log |
+| `Connect-IPPSSession`, `Connect-ExchangeOnline`, `Disconnect-ExchangeOnline` | Sign in and out; they change nothing in the tenant |
+
+**Tenant-changing commands that appear in the code but are never run**
+
+`Set-DlpCompliancePolicy`, `New-DlpCompliancePolicy`, `Set-DlpComplianceRule`, `New-DlpComplianceRule`, `New-LabelPolicy` and `Set-AdminAuditLogConfig` appear only inside `Add-ImplementationGuidance`, inside `@' ... '@` blocks. PowerShell treats these blocks as plain text. The script prints them into **section 21 ("Applying the configuration")** of the Word report as examples for the customer to review and run themselves, if they choose to.
+
+**Commands that change your own PC (not the tenant)**
+
+| Command | What it does | When |
+|---|---|---|
+| `New-Item` | Creates the output folder | Every run, or when you change the output folder in Settings |
+| `Set-Content`, `Add-Content`, `Export-Csv`, `Export-Excel` | Write the output files and `Collection.log` | Every run |
+| `Remove-Item` | Deletes `DLP_Assessment_Report.docx` in that run's output folder before writing it again | When the Word report is built |
+| `Install-Module`, `Install-PackageProvider` | Install ExchangeOnlineManagement and ImportExcel for your user account only | Only when you choose option 1 and answer Yes |
+| `Uninstall-Module`, `Remove-Module` | Remove old copies of ExchangeOnlineManagement | Only when you choose the clean reinstall in option 1 |
+| `Import-Module`, `Add-Type` | Load modules and .NET libraries into the PowerShell window | When needed |
+
+**The script's own functions.** Most `New-`, `Add-`, `Export-` and `Invoke-` names in the code are the script's own functions, for example `New-DlpWordReport`, `Add-DocTable` and `Export-Dataset`. They build the report and output files.
+
+**Check it yourself.** Run the script with an account that has only read-only roles (see [Permissions](#permissions)). If anything tried to make a change, the tenant would refuse it. To list every command the script runs that could change a tenant, search the code outside the example blocks:
+
+```powershell
+Select-String -Path .\Get-M365DlpConfiguration.ps1 -Pattern '^\s*(Set|New|Remove|Enable|Disable)-(Dlp|Label|AutoSensitivity|AdminAuditLog|TransportRule|Protection)' |
+    Where-Object { $_.Line -notmatch '^\s*#' }
+```
+
+Every result is inside an example block in `Add-ImplementationGuidance`.
 
 ---
 
