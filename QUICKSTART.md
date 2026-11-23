@@ -6,7 +6,7 @@ This guide gets you from download to a finished DLP audit report in about 15 min
 
 ## What the tool does
 
-`Get-M365DlpConfiguration.ps1` connects to a Microsoft 365 tenant and collects the **Microsoft Purview Data Loss Prevention (DLP)** configuration: policies, rules, sensitive information types, sensitivity labels, Endpoint DLP, alerts and who manages them. It then produces:
+`Get-M365DlpConfiguration.ps1` connects to a Microsoft 365 tenant and collects the **Microsoft Purview Data Loss Prevention (DLP)** configuration: policies, rules, sensitive information types, sensitivity labels and their settings, Endpoint DLP, alerts and who manages them. By default it also covers the related Purview areas: **retention and records**, **insider risk, communication compliance and information barriers**, and **audit and eDiscovery**. It then produces:
 
 - **`DLP_Assessment_Report.docx`**: a plain-English Word report. It covers what is configured, how mature the setup is, what happens when someone shares sensitive data, which problems were found, and a prioritised action plan.
 - **`DLP_Alerts_Dashboard.html`** *(optional)*: an easy-to-read page showing what the DLP alerts are about.
@@ -14,7 +14,7 @@ This guide gets you from download to a finished DLP audit report in about 15 min
 
 It is **read-only**: it never changes anything in the tenant, and it does not use Microsoft Graph.
 
-> **Why are there `Set-` and `New-` commands in the code?** They are example commands that the script writes into section 21 of the Word report, for the customer to review. The script never runs them. The only tenant commands it runs are `Get-*`, `Export-ActivityExplorerData`, `Export-ContentExplorerData` and `Search-UnifiedAuditLog`, which only read data. The only things it changes are files in its output folder on your PC, plus PowerShell modules if you choose to install them in option 1. Full details: [Is it really read-only?](README.md#is-it-really-read-only)
+> **Why are there `Set-` and `New-` commands in the code?** They are example commands that the script writes into the "Applying the configuration" section of the Word report, for the customer to review. The script never runs them. The only tenant commands it runs are `Get-*`, `Export-ActivityExplorerData`, `Export-ContentExplorerData` and `Search-UnifiedAuditLog`, which only read data. The only things it changes are files in its output folder on your PC, plus PowerShell modules if you choose to install them in option 1. Full details: [Is it really read-only?](README.md#is-it-really-read-only)
 
 ---
 
@@ -54,8 +54,8 @@ Unblock-File .\Get-M365DlpConfiguration.ps1
    1. Install / update required PowerShell modules
    2. Connect to tenant
    3. Test credentials and tenant access
-   4. Report on individual DLP items
-   5. Complete tenant DLP report
+   4. Report on individual items
+   5. Complete tenant report (DLP plus retention, risk and compliance, audit and eDiscovery)
    6. Settings
    7. Disconnect / switch tenant
    8. DLP alerts dashboard (what the DLP alerts are about)
@@ -100,6 +100,9 @@ Press **5**. You are asked a few questions; press **Enter** to accept the defaul
 | Include Exchange Online mail flow rules and audit config? | **Y** |
 | Include Content Explorer (where sensitive data is stored)? | **Y** for a fuller picture (needs the Content Explorer List Viewer role; adds a few minutes) |
 | Include DLP rule activity and alerts, with the alerts dashboard? | **Y** (needs View-Only Audit Logs; signs in to Exchange Online, so you may be asked to sign in again) |
+| Include data lifecycle and records management? | **Y** (retention policies and labels, records; needs View-Only Retention Management) |
+| Include risk and compliance? | **Y** if the account has the insider risk and communication compliance roles; otherwise **N** |
+| Include audit and eDiscovery? | **Y** (audit log retention and eDiscovery cases and holds; signs in to Exchange Online for the audit log status) |
 | Show changes since the previous report? | Only asked when an earlier report for the same tenant exists. **Y** to include a "what has changed" section |
 
 The script works through each area and shows progress. Green = done, yellow = skipped or no data, red = failed. A typical run takes 5 to 20 minutes, depending on the size of the tenant and the options chosen.
@@ -117,7 +120,7 @@ Alerts dashboard: ...\DLP_Alerts_Dashboard.html
 ## Step 5: Open the results
 
 1. Open **`DLP_Assessment_Report.docx`**. If Word asks to update fields, choose **Yes** so the contents page fills in. If it opens in Protected View, select **Enable Editing** first.
-2. Start with **section 2 (Executive summary)** for the maturity score and key observations, then **section 20** for the action plan.
+2. Start with **section 2 (Executive summary)** for the maturity score and key observations, then **Recommended next steps** (section 23 when every area is included) for the action plan.
 3. Open **`DLP_Alerts_Dashboard.html`** in a browser to see what the DLP alerts are about.
 4. Check **`99_Collection_Errors.csv`**. Anything listed there was not collected, usually because a role is missing.
 

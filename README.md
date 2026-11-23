@@ -1,6 +1,6 @@
 # Get-M365DlpConfiguration
 
-A read-only PowerShell tool for discovering and documenting **Microsoft Purview Data Loss Prevention (DLP)** configuration in any Microsoft 365 tenant.
+A read-only PowerShell tool for discovering and documenting **Microsoft Purview Data Loss Prevention (DLP)** configuration in any Microsoft 365 tenant. It also covers the related Purview areas that affect how information is protected: **data lifecycle and records management**, **insider risk, communication compliance and information barriers**, and **audit and eDiscovery**.
 
 It is built for consultants and administrators who need a consistent evidence pack at the start of a DLP engagement. Run it the same way in every tenant, get the same set of outputs, and compare tenants or runs over time.
 
@@ -40,7 +40,7 @@ It is built for consultants and administrators who need a consistent evidence pa
 | Rules, conditions and actions | Every rule with its conditions, exceptions, block / block with override / notify / audit response, policy tips, override settings, alerts and incident reports |
 | Classification | Built-in and custom sensitive information types, custom rule package XML, keyword dictionaries, Exact Data Match schemas, trainable classifiers used in rules |
 | Confidence levels | Confidence level and instance counts for every classifier referenced by every rule |
-| Sensitivity labels | Labels, label policies, auto-labelling policies and rules, and labels used as DLP conditions |
+| Sensitivity labels | Labels, label policies, auto-labelling policies and rules, and labels used as DLP conditions. **Label settings:** encryption (who gets access, user-defined permissions, offline access, expiry), content marking (header, footer, watermark), what each label applies to (files, emails, sites, groups and Teams, meetings) and site and group settings (privacy, guest access, external sharing, unmanaged devices); default and mandatory labelling from label policies |
 | Endpoint DLP | Global settings (browsers, service domains, printer, removable media and network share groups) and per-rule device restrictions (USB, printing, browser and cloud upload, clipboard) |
 | Alerts | DLP alert policies, and rules that raise alerts or incident reports |
 | Ownership | Purview role groups and members holding DLP-relevant roles |
@@ -48,8 +48,13 @@ It is built for consultants and administrators who need a consistent evidence pa
 | Exchange Online *(optional)* | Mail flow rules (including legacy Exchange DLP) and unified audit log status |
 | Content Explorer *(optional)* | How many stored emails, files and Teams messages contain each sensitive information type and label, by location, and where the largest concentrations are |
 | DLP rule activity and alerts *(optional)* | DLP rule matches, overrides and false positives, and the DLP alerts raised, from the unified audit log (default 30 days), plus an **alerts dashboard** |
+| Data lifecycle and records *(on by default)* | Retention policies and their rules, retention label policies (published or auto-applied), retention labels (records, regulatory records, disposition review, event-based retention), adaptive scopes, and retention coverage of email, SharePoint, OneDrive and Teams |
+| Risk and compliance *(on by default)* | Insider risk management policies and their templates, communication compliance policies and rules, information barrier policies and segments |
+| Audit and eDiscovery *(on by default)* | Audit log retention policies, unified audit log status, eDiscovery cases (Standard and Premium) and their holds |
 
 **No Microsoft Graph.** Everything uses Security & Compliance PowerShell and, optionally, Exchange Online PowerShell.
+
+The three related Purview areas are included in the complete report by default and can each be turned off (**Settings 19–21**, the questions in **option 5**, or `-Scope`). Each is also available on its own in **option 4** (areas 15, 16 and 17).
 
 A complete run also produces a **Word assessment report** (`DLP_Assessment_Report.docx`): a plain-English document that explains what each DLP feature is and why it matters, shows what was found in the tenant, lists things to consider, and links to the relevant Microsoft Learn pages. It is built directly by the script; Microsoft Word and extra modules are not required.
 
@@ -74,7 +79,7 @@ Yes. If you look through the script you will see `Set-` and `New-` commands, so 
 
 **Tenant-changing commands that appear in the code but are never run**
 
-`Set-DlpCompliancePolicy`, `New-DlpCompliancePolicy`, `Set-DlpComplianceRule`, `New-DlpComplianceRule`, `New-LabelPolicy` and `Set-AdminAuditLogConfig` appear only inside `Add-ImplementationGuidance`, inside `@' ... '@` blocks. PowerShell treats these blocks as plain text. The script prints them into **section 21 ("Applying the configuration")** of the Word report as examples for the customer to review and run themselves, if they choose to.
+`Set-DlpCompliancePolicy`, `New-DlpCompliancePolicy`, `Set-DlpComplianceRule`, `New-DlpComplianceRule`, `New-LabelPolicy`, `Set-AdminAuditLogConfig`, `New-RetentionCompliancePolicy`, `New-RetentionComplianceRule` and `New-UnifiedAuditLogRetentionPolicy` appear only inside `Add-ImplementationGuidance`, inside `@' ... '@` blocks. PowerShell treats these blocks as plain text. The script prints them into the **"Applying the configuration"** section of the Word report (the last numbered section) as examples for the customer to review and run themselves, if they choose to.
 
 **Commands that change your own PC (not the tenant)**
 
@@ -92,7 +97,7 @@ Yes. If you look through the script you will see `Set-` and `New-` commands, so 
 **Check it yourself.** Run the script with an account that has only read-only roles (see [Permissions](#permissions)). If anything tried to make a change, the tenant would refuse it. To list every command the script runs that could change a tenant, search the code outside the example blocks:
 
 ```powershell
-Select-String -Path .\Get-M365DlpConfiguration.ps1 -Pattern '^\s*(Set|New|Remove|Enable|Disable)-(Dlp|Label|AutoSensitivity|AdminAuditLog|TransportRule|Protection)' |
+Select-String -Path .\Get-M365DlpConfiguration.ps1 -Pattern '^\s*(Set|New|Remove|Enable|Disable|Start|Stop)-(Dlp|Label|AutoSensitivity|AdminAuditLog|TransportRule|Protection|Retention|ComplianceTag|UnifiedAuditLog|InsiderRisk|SupervisoryReview|InformationBarrier|OrganizationSegment|ComplianceCase|CaseHold|AdaptiveScope)' |
     Where-Object { $_.Line -notmatch '^\s*#' }
 ```
 
@@ -168,12 +173,13 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
    Connected: admin@contoso.onmicrosoft.com  |  Tenant: 00000000-0000-...
    Output: C:\Users\you\Documents   Activity Explorer: Off   Exchange: Off
    Content Explorer: Off   DLP rule activity: Off   Customer: (tenant name)
+   Retention and records: On   Risk and compliance: On   Audit and eDiscovery: On
 --------------------------------------------------------------------------------
    1. Install / update required PowerShell modules
    2. Connect to tenant
    3. Test credentials and tenant access
-   4. Report on individual DLP items
-   5. Complete tenant DLP report
+   4. Report on individual items
+   5. Complete tenant report (DLP plus retention, risk and compliance, audit and eDiscovery)
    6. Settings
    7. Disconnect / switch tenant
    8. DLP alerts dashboard (what the DLP alerts are about)
@@ -185,9 +191,9 @@ Then work through the menu in order: **1** (modules) → **2** (connect) → **3
 | **1. Install / update modules** | Shows installed versions, installs or updates ExchangeOnlineManagement and ImportExcel for the current user (no admin rights needed), and offers a **clean reinstall** that removes every version first when more than one is found. |
 | **2. Connect to tenant** | Signs in to Security & Compliance PowerShell, or switches to a different account or tenant. Shows the account, tenant ID and organisation, and how many key DLP cmdlets the account can use. |
 | **3. Test credentials and tenant access** | Runs a minimal read-only call against every cmdlet the reports use and shows **PASS**, **MISSING** (role or licence missing) or **FAIL** per area. Lists the account's Purview role groups and saves the results to CSV. Optionally tests Exchange Online. |
-| **4. Report on individual DLP items** | Choose one or more of the 14 [report areas](#report-areas), for example `2,3,8`. |
-| **5. Complete tenant DLP report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report, the action plan and the Excel workbook. Asks whether to include Activity Explorer, Exchange Online, Content Explorer and DLP rule activity, and, when an earlier report for the same tenant exists, whether to show the changes since then. |
-| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, the Word report and its frameworks, Content Explorer (on/off, number of types), DLP rule activity (on/off, days), **customer name, assessor name and logo** for the report cover, and a fixed folder to compare with. |
+| **4. Report on individual items** | Choose one or more of the 17 [report areas](#report-areas), for example `2,3,8` or `15,16,17`. |
+| **5. Complete tenant report** | Every area plus the assessment summary (CSV and HTML), the Word assessment report, the action plan and the Excel workbook. Asks whether to include Activity Explorer, Exchange Online, Content Explorer, DLP rule activity, **data lifecycle and records**, **risk and compliance** and **audit and eDiscovery** (the last three default to Yes), and, when an earlier report for the same tenant exists, whether to show the changes since then. |
+| **6. Settings** | Output folder, admin account, Activity Explorer days and page cap, Exchange Online, sign-in with `-DisableWAM`, the Word report and its frameworks, Content Explorer (on/off, number of types), DLP rule activity (on/off, days), **customer name, assessor name and logo** for the report cover, a fixed folder to compare with, names in the alerts dashboard, and **items 19–22**: include retention and records, include risk and compliance, include audit and eDiscovery, and the maximum number of eDiscovery cases whose holds are read. |
 | **7. Disconnect / switch tenant** | Signs out so you can move to the next customer tenant without restarting. |
 | **8. DLP alerts dashboard** | Asks how many days to include (1–90), reads the DLP alerts and rule matches from the unified audit log, and opens **DLP_Alerts_Dashboard.html**: an easy-to-read page explaining what the alerts are about. See [DLP alerts dashboard](#dlp-alerts-dashboard). |
 
@@ -226,6 +232,13 @@ Use `-Mode` for repeat runs, scripting or several tenants.
 # Selected areas only (policies, rules, Endpoint DLP)
 .\Get-M365DlpConfiguration.ps1 -Mode Area -Area 2,3,8 -UserPrincipalName admin@contoso.onmicrosoft.com
 
+# Retention, risk and compliance, and audit and eDiscovery only
+.\Get-M365DlpConfiguration.ps1 -Mode Area -Area 15,16,17 -UserPrincipalName admin@contoso.onmicrosoft.com
+
+# Complete report covering DLP only, or DLP plus retention
+.\Get-M365DlpConfiguration.ps1 -Mode Full -Scope DLP -UserPrincipalName admin@contoso.onmicrosoft.com
+.\Get-M365DlpConfiguration.ps1 -Mode Full -Scope DLP, Lifecycle -UserPrincipalName admin@contoso.onmicrosoft.com
+
 # Areas by name
 .\Get-M365DlpConfiguration.ps1 -Mode Area -Area 'Sensitivity labels','Endpoint'
 ```
@@ -248,7 +261,9 @@ foreach ($t in $tenants) {
 | Parameter | Default | Description |
 |---|---|---|
 | `-Mode` | `Menu` | `Menu`, `InstallModules`, `TestAccess`, `Full`, `Area` or `AlertDashboard` |
-| `-Area` | | With `-Mode Area`: area numbers 1–14 or part of an area name |
+| `-Area` | | With `-Mode Area`: area numbers 1–17 or part of an area name |
+| `-Scope` | `All` | What the complete report covers. DLP is always included; add `Lifecycle` (retention and records), `RiskCompliance` (insider risk, communication compliance, information barriers) and `Audit` (audit log retention, eDiscovery). `All` includes everything |
+| `-MaxEDiscoveryCases` | `100` | Maximum number of active eDiscovery cases whose holds are read (1–500); each case needs one extra call |
 | `-OutputRoot` | Documents | Folder in which the time-stamped output folder is created |
 | `-UserPrincipalName` | | Admin account to sign in with |
 | `-IncludeActivityExplorer` | Off | Include Activity Explorer in the complete report |
@@ -292,6 +307,11 @@ Full help: `Get-Help .\Get-M365DlpConfiguration.ps1 -Detailed`
 | 12 | Exchange Online mail flow rules and audit | `70`, `71` |
 | 13 | Content Explorer: where sensitive data is stored | `62`, `63` |
 | 14 | DLP rule activity and alerts from the audit log, with the alerts dashboard | `64`–`67`, `DLP_Alerts_Dashboard.html` |
+| 15 | Data lifecycle and records: retention policies, retention labels, records, adaptive scopes | `100`–`106` |
+| 16 | Risk and compliance: insider risk, communication compliance, information barriers | `200`, `201`, `210`–`212`, `220`–`222` |
+| 17 | Audit and eDiscovery: audit log retention, audit log status, eDiscovery cases and holds | `300`, `310`, `311`, `71` (signs in to Exchange Online for the audit log status) |
+
+Area 7 also writes `35_Sensitivity_Label_Settings` (encryption, content marking, scope and site and group settings for each label). Files for areas 15–17 are numbered in the 100s, 200s and 300s so the DLP file numbers stay the same as earlier versions.
 
 ---
 
@@ -375,7 +395,7 @@ Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Asses
 | 9. Exact Data Match | EDM schemas with their columns (searchable columns marked) and EDM-based detectors |
 | 10. Trainable classifiers | Machine-learning classifiers referenced by rules |
 | 11. Confidence levels and instance counts | Detection thresholds, low-confidence and single-instance detections |
-| 12. Sensitivity labels and DLP | Label taxonomy, encryption, labels used in DLP; each label policy (labels published, who to, mandatory/default label settings) and each auto-labelling policy (label applied, status, where, what it looks for) |
+| 12. Sensitivity labels and DLP | Label taxonomy, encryption, labels used in DLP; each label policy (labels published, who to, mandatory/default label settings) and each auto-labelling policy (label applied, status, where, what it looks for); **label settings** for every label: what it applies to, encryption, content marking, and sites, groups and Teams settings |
 | 13. Endpoint DLP | USB and removable storage, printing, browser and cloud uploads; device restrictions by rule; tenant-wide device settings with friendly names |
 | 14. DLP for Microsoft 365 Copilot | Policies protecting Copilot and Copilot Chat |
 | 15. Deployment state and simulation | Enforced, simulation and disabled policies; **configuration hygiene checks** (unchanged templates, high-risk rules that do not block, alert recipients, overlapping rules, stale or long-running simulation policies, default policy tips, unused detectors and labels, unprotected stored data, rules that never fire or are routinely overridden) |
@@ -383,13 +403,18 @@ Every complete report (menu option 5, or `-Mode Full`) also creates **`DLP_Asses
 | 17. Activity Explorer and DLP rule activity | Activity summary, and matches, overrides, false positives and distinct users per rule from the audit log (user names are kept out of the report) |
 | 18. Exchange mail flow and auditing | Each mail flow rule with its state and Exchange's own description, and unified audit log status (when Exchange Online is included) |
 | 19. Operational ownership | Role groups and members with DLP-relevant roles |
-| 20. Recommended next steps | **Prioritised action plan** (priority, action, effort, licence), licensing notes, and topic-by-topic findings with the licence each needs |
-| 21. Applying the configuration | Order of work and step-by-step guidance for each gap found |
+| 20. Data lifecycle and records management *(when included)* | Retention coverage of email, SharePoint, OneDrive, Teams chats and channels; each retention policy (type, status, locations, retention); each retention label (record type, retention, disposition review, how applied); adaptive scopes |
+| 21. Insider risk, communication compliance and information barriers *(when included)* | Insider risk policies and templates, and whether DLP raises the high-severity alerts a Data leaks policy needs; communication compliance policies (reviewers, share reviewed); information barrier policies, segments and application status |
+| 22. Audit and eDiscovery *(when included)* | Unified audit log status, audit log retention policies (and whether DLP activity is kept longer), eDiscovery cases and holds by type (case names are kept out of the report) |
+| 23. Recommended next steps | **Prioritised action plan** (priority, action, effort, licence), licensing notes, and topic-by-topic findings with the licence each needs |
+| 24. Applying the configuration | Order of work and step-by-step guidance for each gap found |
 | Appendices | A Collection details and gaps, B Glossary, C Evidence files, D Framework references, **E DLP policies and rules in detail** |
+
+Sections 20 to 22 appear only for the areas included in the run, and the sections after them are numbered to follow on. With every area included the next steps are section 23 and the guidance section 24; with `-Scope DLP` they are sections 20 and 21 as in earlier versions.
 
 ### How each area section is laid out
 
-Sections 3 to 19 all use the same layout:
+Sections 3 to 22 all use the same layout:
 
 | Part | What it gives the reader |
 |---|---|
@@ -425,9 +450,9 @@ Observations come from simple, transparent checks on the collected configuration
 
 | Priority | Example checks |
 |---|---|
-| **High** | No DLP policies; a core location (Exchange, SharePoint, OneDrive, Teams, devices) with no enforced policy; no sensitivity labels, or labels not published; no rules raising alerts; unified audit log disabled |
-| **Medium** | Policies left in simulation; rules that only audit; high-severity rules without alerts; low-confidence detections; labels not used in DLP; device policies without USB restrictions; no Copilot policy; alerts sent only to SiteAdmin; legacy mail flow rules inspecting sensitive information |
-| **Low** | Disabled or stale policies; rules allowing overrides; unused custom SITs; a large number of people holding DLP roles |
+| **High** | No DLP policies; a core location (Exchange, SharePoint, OneDrive, Teams, devices) with no enforced policy; no sensitivity labels, or labels not published; no rules raising alerts; unified audit log disabled; no retention policies or retention labels at all |
+| **Medium** | Labels for highly sensitive content that do not encrypt; a core location with no retention policy; retention policy distribution errors; no insider risk policies, or a Data leaks policy with no high-severity DLP alerts to trigger it; communication compliance policies with no reviewers; policies left in simulation; rules that only audit; high-severity rules without alerts; low-confidence detections; labels not used in DLP; device policies without USB restrictions; no Copilot policy; alerts sent only to SiteAdmin; legacy mail flow rules inspecting sensitive information |
+| **Low** | Disabled or stale policies; rules allowing overrides; unused custom SITs; a large number of people holding DLP roles; no label for sites, groups and Teams; no default or mandatory label; retention labels in no policy; record labels deleting without disposition review; no audit retention for DLP activity; eDiscovery cases open for more than two years |
 
 > Observations are prompts for discussion, generated from configuration alone. They do not know the organisation's risk appetite, licensing or plans. Review and agree priorities with the customer before presenting them as recommendations.
 
@@ -441,6 +466,8 @@ The report links every area of DLP configuration to recognised security framewor
 | **NIST CSF 2.0** | PR.DS-01 data at rest, PR.DS-02 data in transit, PR.DS-10 data in use, ID.AM-07 data inventory, DE.CM-03 monitoring |
 | **NIST SP 800-53 Rev. 5** | AC-4 Information flow enforcement, SC-7(10) Prevent exfiltration, MP-7 Media use, AC-16 Security attributes, SI-4, AU-13 |
 | **ISO/IEC 27001:2022** | 8.12 Data leakage prevention, 5.12 Classification, 5.13 Labelling, 5.14 Information transfer, 7.10 Storage media, 8.16 Monitoring |
+
+The related Purview areas add: retention and records (CAF B3.c; CSF ID.AM-08; 800-53 SI-12, MP-6; ISO 5.33, 8.10), insider risk and communication compliance (CAF C1, C2; CSF DE.CM-03, DE.AE-02; 800-53 PM-12, SI-4; ISO 8.16, 5.3) and audit and eDiscovery (CAF C1; CSF PR.PS-04, RS.AN-03; 800-53 AU-11, AU-12; ISO 8.15, 5.28).
 
 References appear in three places:
 
@@ -456,9 +483,9 @@ Choose which frameworks appear with **Settings > 9** or `-Frameworks` (`NCSC`, `
 
 > The mapping is indicative, not a compliance assessment. Framework outcomes also depend on policies, processes and people the script cannot see. Confirm references against the framework documents before using them in formal assurance work.
 
-### Applying the configuration (section 21)
+### Applying the configuration (last numbered section)
 
-Section 21 of the report turns findings into practical guidance. It starts with a recommended order of work, then includes a guidance block **only for the gaps found in that tenant**:
+The "Applying the configuration" section (section 24 when every area is included) turns findings into practical guidance. It starts with a recommended order of work, then includes a guidance block **only for the gaps found in that tenant**:
 
 | Guidance | Included when |
 |---|---|
@@ -474,6 +501,9 @@ Section 21 of the report turns findings into practical guidance. It starts with 
 | Create custom sensitive information types | No custom SITs |
 | Consider Exact Data Match | EDM not in use |
 | Turn on the unified audit log | Exchange data collected and auditing disabled |
+| Apply retention policies to the core locations | Retention and records included, and email, SharePoint, OneDrive or Teams has no retention policy |
+| Keep DLP audit records for longer | Audit and eDiscovery included, and no audit log retention policy covers DLP activity |
+| Start insider risk management with a Data leaks policy | Risk and compliance included, insider risk available, and no policies exist |
 
 Each block shows **why it applies**, the **framework references** it supports, **numbered steps in the Microsoft Purview portal**, a **PowerShell example** to adapt, **how to check it worked**, and **Microsoft Learn** links.
 
@@ -481,7 +511,7 @@ Each block shows **why it applies**, the **framework references** it supports, *
 
 ### Microsoft Learn links
 
-Each section links to the relevant Microsoft Learn documentation: data loss prevention, policy reference, simulation mode, policy tips, sensitive information types and entity definitions, custom SITs, keyword dictionaries, Exact Data Match, trainable classifiers, sensitivity labels, auto-labelling, labels as DLP conditions, Endpoint DLP and its settings, DLP for Microsoft 365 Copilot, DLP alerts, Activity Explorer, Purview permissions and Exchange mail flow rules.
+Each section links to the relevant Microsoft Learn documentation: data loss prevention, policy reference, simulation mode, policy tips, sensitive information types and entity definitions, custom SITs, keyword dictionaries, Exact Data Match, trainable classifiers, sensitivity labels, label encryption, labels for Teams, groups and sites, auto-labelling, labels as DLP conditions, Endpoint DLP and its settings, DLP for Microsoft 365 Copilot, DLP alerts, Activity Explorer, Purview permissions, Exchange mail flow rules, retention, records management, adaptive scopes, disposition, insider risk management, communication compliance, information barriers, auditing solutions, audit log retention policies and eDiscovery.
 
 All links are kept in one table (`$Script:LearnLinks`) near the start of the Word report region of the script, so a page that Microsoft moves is a one-line fix.
 
@@ -541,10 +571,19 @@ The simplest option is the **Compliance Administrator** role group. For least pr
 | Exchange Online | Exchange View-Only Organization Management |
 | Content Explorer | Content Explorer List Viewer |
 | DLP rule activity, alerts and the alerts dashboard (audit log) | View-Only Audit Logs (Exchange Online) or Audit Reader (Purview) |
+| Retention policies, retention labels, records, adaptive scopes (area 15) | View-Only Retention Management and View-Only Record Management |
+| Insider risk policies (area 16) | Insider Risk Management Admins role group (there is no view-only role for policies) |
+| Communication compliance policies and rules (area 16) | Communication Compliance Admins role group (there is no view-only role for policies) |
+| Information barrier policies and segments (area 16) | Information Barrier Compliance Management (included in Compliance Administrator) |
+| Audit log retention policies (area 17) | Audit Reader or Audit Manager |
+| Unified audit log status (areas 12 and 17) | View-Only Audit Logs or Exchange View-Only Organization Management (Exchange Online) |
+| eDiscovery cases and holds (area 17) | eDiscovery Manager. Only cases the account is a member of are listed unless it is also an **eDiscovery Administrator** |
+
+Insider risk, communication compliance and information barriers have no view-only role for their policies, so the account needs that feature's own role group. The script still only runs `Get-` commands against them. If you would rather not grant those roles, turn the area off (Settings 20, or `-Scope DLP, Lifecycle, Audit`): the report then leaves the section out instead of showing a gap.
 
 Role changes can take up to an hour to apply. Use **option 3** to confirm what the account can read.
 
-Some features also need licences. DLP for Exchange, SharePoint and OneDrive and manual labelling are in Microsoft 365 E3 and Business Premium. Teams chat DLP, Endpoint DLP, Copilot DLP, auto-labelling, EDM, trainable classifiers, Activity Explorer and Content Explorer need Microsoft 365 E5, E5 Information Protection & Governance, or the Microsoft Purview Suite (formerly E5 Compliance). The report shows the licence each recommended action needs; it reports configuration, not entitlement, so confirm against [Microsoft's licensing guidance](https://learn.microsoft.com/en-us/office365/servicedescriptions/microsoft-365-service-descriptions/microsoft-365-tenantlevel-services-licensing-guidance/microsoft-365-security-compliance-licensing-guidance).
+Some features also need licences. DLP for Exchange, SharePoint and OneDrive and manual labelling are in Microsoft 365 E3 and Business Premium. Teams chat DLP, Endpoint DLP, Copilot DLP, auto-labelling, EDM, trainable classifiers, Activity Explorer and Content Explorer need Microsoft 365 E5, E5 Information Protection & Governance, or the Microsoft Purview Suite (formerly E5 Compliance). Retention policies, manual retention labels, Audit (Standard) and eDiscovery holds are in E3. Auto-applied retention labels, adaptive scopes and records management need E5, E5 Information Protection & Governance or Purview Suite; insider risk management, communication compliance and information barriers need E5, E5 Insider Risk Management or Purview Suite; Audit (Premium) with audit log retention policies and eDiscovery (Premium) need E5, E5 eDiscovery & Audit or Purview Suite. The report shows the licence each recommended action needs; it reports configuration, not entitlement, so confirm against [Microsoft's licensing guidance](https://learn.microsoft.com/en-us/office365/servicedescriptions/microsoft-365-service-descriptions/microsoft-365-tenantlevel-services-licensing-guidance/microsoft-365-security-compliance-licensing-guidance).
 
 ---
 
@@ -580,6 +619,10 @@ Some features also need licences. DLP for Exchange, SharePoint and OneDrive and 
 - **DLP rule activity:** limited by audit log retention (180 days with Audit Standard) and `-AuditMaxRecords`. Exchange Online transport-rule DLP is not included.
 - **Maturity scores, coverage map and scenarios** are generated from the configuration. They are a starting point for discussion, not a formal compliance assessment.
 - **Cell size:** CSV and Excel values are truncated at 32,000 characters. Use the JSON file for the full value.
+- **eDiscovery:** only cases visible to the account are reported, and holds are read for up to `-MaxEDiscoveryCases` active cases. Case names are in `310_eDiscovery_Cases` but are kept out of the Word report.
+- **Insider risk and communication compliance:** the cmdlets return policy settings, not alerts, cases or user risk scores, so the report describes what is configured, not what has been found.
+- **Retention coverage:** a location counts as covered when an enabled retention policy includes it. Adaptive policies count as "selected only", and retention labels are not counted because they apply only to labelled items.
+- **Maturity scores** cover DLP only; the related Purview areas have their own status in the framework tables and status by area.
 
 ---
 
